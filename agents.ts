@@ -11,11 +11,13 @@
  *   Ctrl+Shift+A - cycle through agents
  *   /agent       - show current agent or switch by name
  *
- * Constraints are published to globalThis.__piAgentConstraints for the
- * sandbox extension to enforce.
+ * Constraints are published on the shared extension event bus for the sandbox
+ * extension to enforce.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+
+const SANDBOX_AGENT_CONSTRAINTS_EVENT = "sandbox:agent-constraints";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -23,8 +25,6 @@ interface AgentConstraints {
 	bash?: {
 		/** If set, only commands starting with one of these prefixes are allowed. */
 		allowPrefixes?: string[];
-		/** Whether safe commands (ls, grep, etc.) are allowed. Default true. */
-		allowSafe?: boolean;
 	};
 }
 
@@ -34,11 +34,6 @@ interface Agent {
 	tools: string[] | null; // null = all tools
 	constraints?: AgentConstraints;
 	prompt: string;
-}
-
-declare global {
-	var __piAgentConstraints: AgentConstraints | undefined;
-	var __piAgentName: string | undefined;
 }
 
 // ── Agent definitions ────────────────────────────────────────────────────────
@@ -68,7 +63,6 @@ const AGENTS: Agent[] = [
 		constraints: {
 			bash: {
 				allowPrefixes: ["agent-browser", "curl", "wget"],
-				allowSafe: false,
 			},
 		},
 		prompt: [
@@ -92,15 +86,17 @@ const AGENTS: Agent[] = [
 export default function (pi: ExtensionAPI) {
 	let allToolNames: string[] = [];
 	let currentIndex = 0;
-	let lastMessageAgentIndex = 0; // tracks the agent used for the last actual message
+	let lastMessageAgentIndex = 0;
 
 	function current(): Agent {
 		return AGENTS[currentIndex];
 	}
 
 	function publish(agent: Agent) {
-		globalThis.__piAgentConstraints = agent.constraints;
-		globalThis.__piAgentName = agent.name;
+		pi.events.emit(SANDBOX_AGENT_CONSTRAINTS_EVENT, {
+			agentName: agent.name,
+			constraints: agent.constraints,
+		});
 	}
 
 	function applyAgent(ctx: { ui: any }) {
@@ -131,11 +127,7 @@ export default function (pi: ExtensionAPI) {
 		lastMessageAgentIndex = currentIndex;
 
 		const result: any = {};
-
-		if (agent.prompt) {
-			result.systemPrompt = event.systemPrompt + "\n\n" + agent.prompt;
-		}
-
+		if (agent.prompt) result.systemPrompt = event.systemPrompt + "\n\n" + agent.prompt;
 		if (switched) {
 			result.message = {
 				customType: "agent-switch",
@@ -143,7 +135,6 @@ export default function (pi: ExtensionAPI) {
 				display: true,
 			};
 		}
-
 		return Object.keys(result).length > 0 ? result : undefined;
 	});
 
@@ -164,16 +155,11 @@ export default function (pi: ExtensionAPI) {
 			if (!name) {
 				const agent = current();
 				const tools = agent.tools ? agent.tools.join(", ") : "all";
-				const lines = [
-					`Current agent: ${agent.label}`,
-					`Tools: ${tools}`,
-				];
+				const lines = [`Current agent: ${agent.label}`, `Tools: ${tools}`];
 				if (agent.constraints?.bash?.allowPrefixes) {
 					lines.push(`Bash restricted to: ${agent.constraints.bash.allowPrefixes.join(", ")}`);
 				}
-				if (agent.name === "web") {
-					lines.push("Network remains limited by sandbox allowed domains.");
-				}
+				if (agent.name === "web") lines.push("Network remains limited by sandbox allowed domains.");
 				lines.push("", `Available: ${AGENTS.map((a) => a.name).join(", ")}`);
 				lines.push("Shortcut: Ctrl+Shift+A to cycle");
 				ctx.ui.notify(lines.join("\n"), "info");
@@ -182,13 +168,9 @@ export default function (pi: ExtensionAPI) {
 
 			const index = AGENTS.findIndex((a) => a.name === name);
 			if (index === -1) {
-				ctx.ui.notify(
-					`Unknown agent: ${name}\nAvailable: ${AGENTS.map((a) => a.name).join(", ")}`,
-					"error",
-				);
+				ctx.ui.notify(`Unknown agent: ${name}\nAvailable: ${AGENTS.map((a) => a.name).join(", ")}`, "error");
 				return;
 			}
-
 			if (index === currentIndex) {
 				ctx.ui.notify(`Already in ${current().label} mode`, "info");
 				return;
