@@ -8,7 +8,7 @@
  *           the sandbox's allowed domains
  *
  * Switch agents:
- *   Ctrl+Shift+A - cycle through agents
+ *   Alt+A        - cycle through agents
  *   /agent       - show current agent or switch by name
  *
  * Constraints are published on the shared extension event bus for the sandbox
@@ -147,7 +147,7 @@ export default function (pi: ExtensionAPI) {
 		return Object.keys(result).length > 0 ? result : undefined;
 	});
 
-	pi.registerShortcut("ctrl+shift+a", {
+	pi.registerShortcut("alt+a", {
 		description: "Cycle agent mode",
 		handler: async (ctx) => {
 			const nextIndex = (currentIndex + 1) % AGENTS.length;
@@ -170,7 +170,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (agent.name === "web") lines.push("Network remains limited by sandbox allowed domains.");
 				lines.push("", `Available: ${AGENTS.map((a) => a.name).join(", ")}`);
-				lines.push("Shortcut: Ctrl+Shift+A to cycle");
+				lines.push("Shortcut: Alt+A to cycle");
 				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}

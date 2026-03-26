@@ -10,7 +10,7 @@
  *   - bash path prompting is best-effort UX; the OS sandbox is the hard
  *     enforcement boundary for bash
  *   - sensitive file access requires per-command confirmation
- *   - sensitive paths are blocked in bash and denied by the OS sandbox
+ *   - sensitive paths are handled by sandbox prompts before tool execution
  *   - high-risk bash commands require per-command or session-prefix approval
  *   - sandbox config/rules/extension writes are meta-protected
  *   - session-scoped sandbox state survives reloads via session custom entries
@@ -30,9 +30,9 @@
  */
 
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import {
 	createBashTool,
@@ -41,12 +41,14 @@ import {
 	type BashOperations,
 	type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
+import { showTransient, type Binding, type MenuSection } from "./sandbox/transient-menu";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const HOME = homedir();
 const AGENT_DIR = getAgentDir();
 const AUTH_FILE = resolve(AGENT_DIR, "auth.json");
+const SANDBOX_RUNTIME_CWD = resolve(tmpdir(), "pi-sandbox-runtime");
 const SANDBOX_STATE_CUSTOM_TYPE = "sandbox-state";
 const SANDBOX_AGENT_CONSTRAINTS_EVENT = "sandbox:agent-constraints";
 
@@ -98,6 +100,8 @@ interface AgentConstraintsEventData {
 interface RulesFile {
 	dirs: string[];
 	readDirs?: string[];
+	protectedDirs?: string[];
+	protectedReadDirs?: string[];
 	allowedDomains?: string[];
 }
 
@@ -130,6 +134,8 @@ interface SessionStateData {
 	version: 1;
 	dirs: string[];
 	readDirs: string[];
+	protectedDirs: string[];
+	protectedReadDirs: string[];
 	highRiskPrefixes: string[];
 	allowedDomains: string[];
 }
@@ -622,6 +628,10 @@ function highRiskSegments(command: string): Array<{ segment: string; reasons: st
 // ── Sandbox config helpers ───────────────────────────────────────────────────
 
 function createDefaultSandboxConfig(projectRoot: string): SandboxConfig {
+	// Keep the OS sandbox coarse on Linux/macOS: writable roots + network.
+	// Fine-grained file policy (including protected paths like .env, keys, auth,
+	// sandbox config, and extension files) is enforced in this extension before
+	// tool execution, so we don't need path-shaped deny targets in the OS layer.
 	return {
 		enabled: true,
 		network: {
@@ -664,18 +674,9 @@ function createDefaultSandboxConfig(projectRoot: string): SandboxConfig {
 			deniedDomains: [],
 		},
 		filesystem: {
-			denyRead: [
-				...SENSITIVE_DIRS,
-				...SENSITIVE_EXACT_FILES,
-			],
+			denyRead: [],
 			allowWrite: [projectRoot, "/tmp", "/private/tmp"],
-			denyWrite: [
-				".env",
-				".env.*",
-				"*.pem",
-				"*.key",
-				AUTH_FILE,
-			],
+			denyWrite: [],
 		},
 	};
 }
@@ -721,7 +722,7 @@ async function loadSandboxConfigPart(path: string): Promise<LoadedSandboxConfigP
 // ── Rules persistence ────────────────────────────────────────────────────────
 
 function emptyRules(): RulesFile {
-	return { dirs: [], readDirs: [], allowedDomains: [] };
+	return { dirs: [], readDirs: [], protectedDirs: [], protectedReadDirs: [], allowedDomains: [] };
 }
 
 async function loadRulesFromPath(path: string): Promise<LoadedRulesFile> {
@@ -732,6 +733,8 @@ async function loadRulesFromPath(path: string): Promise<LoadedRulesFile> {
 			rules: {
 				dirs: Array.isArray(parsed.dirs) ? parsed.dirs.filter((v: unknown) => typeof v === "string") : [],
 				readDirs: Array.isArray(parsed.readDirs) ? parsed.readDirs.filter((v: unknown) => typeof v === "string") : [],
+				protectedDirs: Array.isArray(parsed.protectedDirs) ? parsed.protectedDirs.filter((v: unknown) => typeof v === "string") : [],
+				protectedReadDirs: Array.isArray(parsed.protectedReadDirs) ? parsed.protectedReadDirs.filter((v: unknown) => typeof v === "string") : [],
 				allowedDomains: Array.isArray(parsed.allowedDomains)
 					? parsed.allowedDomains.filter((v: unknown) => typeof v === "string")
 					: [],
@@ -753,6 +756,8 @@ async function saveRulesToPath(path: string, rules: RulesFile): Promise<void> {
 	const normalized: RulesFile = {
 		dirs: unique(rules.dirs).sort(),
 		readDirs: unique(rules.readDirs ?? []).sort(),
+		protectedDirs: unique(rules.protectedDirs ?? []).sort(),
+		protectedReadDirs: unique(rules.protectedReadDirs ?? []).sort(),
 		allowedDomains: unique(rules.allowedDomains ?? []).sort(),
 	};
 	const content = JSON.stringify(normalized, null, 2) + "\n";
@@ -772,9 +777,10 @@ async function saveRulesToPath(path: string, rules: RulesFile): Promise<void> {
 export default function (pi: ExtensionAPI) {
 	const sessionDirs = new Set<string>();
 	const sessionReadDirs = new Set<string>();
+	const sessionProtectedDirs = new Set<string>();
+	const sessionProtectedReadDirs = new Set<string>();
 	const sessionHighRiskPrefixes = new Set<string>();
 	const sessionAllowedDomains = new Set<string>();
-	const pendingProtectedBashWriteApprovals = new Map<string, Set<string>>();
 	const pendingOneShotAllowedDomains = new Map<string, Set<string>>();
 	const localBash = createBashTool(process.cwd());
 	const localBashOps = createLocalBashOperations();
@@ -806,9 +812,29 @@ export default function (pi: ExtensionAPI) {
 		return osSandboxEnabled && osSandboxInitialized;
 	}
 
+	async function prepareSandboxRuntimeCwd(): Promise<void> {
+		await mkdir(SANDBOX_RUNTIME_CWD, { recursive: true });
+		for (const name of [".git", ".claude"]) {
+			const path = resolve(SANDBOX_RUNTIME_CWD, name);
+			if (existsSync(path) && !statSync(path).isDirectory()) await rm(path, { force: true });
+			await mkdir(path, { recursive: true });
+		}
+	}
+
+	async function withSandboxRuntimeCwd<T>(fn: () => Promise<T> | T): Promise<T> {
+		await prepareSandboxRuntimeCwd();
+		const previousCwd = process.cwd();
+		process.chdir(SANDBOX_RUNTIME_CWD);
+		try {
+			return await fn();
+		} finally {
+			process.chdir(previousCwd);
+		}
+	}
+
 	function syncRuntimeBaseConfig(execCwd = cwd): void {
 		if (!isOsSandboxActive()) return;
-		SandboxManager.updateConfig(effectiveRuntimeConfig(execCwd));
+		void withSandboxRuntimeCwd(() => SandboxManager.updateConfig(effectiveRuntimeConfig(execCwd)));
 	}
 
 	function currentExtraDirs(): string[] {
@@ -817,6 +843,14 @@ export default function (pi: ExtensionAPI) {
 
 	function currentReadOnlyDirs(): string[] {
 		return unique([...(globalRules.readDirs ?? []), ...(projectRules.readDirs ?? []), ...sessionReadDirs]);
+	}
+
+	function currentProtectedDirs(): string[] {
+		return unique([...(globalRules.protectedDirs ?? []), ...(projectRules.protectedDirs ?? []), ...sessionProtectedDirs]);
+	}
+
+	function currentProtectedReadOnlyDirs(): string[] {
+		return unique([...(globalRules.protectedReadDirs ?? []), ...(projectRules.protectedReadDirs ?? []), ...sessionProtectedReadDirs]);
 	}
 
 	function activeDirs(): string[] {
@@ -916,6 +950,8 @@ export default function (pi: ExtensionAPI) {
 			version: 1,
 			dirs: [...sessionDirs].sort(),
 			readDirs: [...sessionReadDirs].filter((dir) => !defaultSessionReadDirs().includes(dir)).sort(),
+			protectedDirs: [...sessionProtectedDirs].sort(),
+			protectedReadDirs: [...sessionProtectedReadDirs].sort(),
 			highRiskPrefixes: [...sessionHighRiskPrefixes].sort(),
 			allowedDomains: [...sessionAllowedDomains].sort(),
 		};
@@ -932,9 +968,10 @@ export default function (pi: ExtensionAPI) {
 	function resetSessionState(): void {
 		sessionDirs.clear();
 		sessionReadDirs.clear();
+		sessionProtectedDirs.clear();
+		sessionProtectedReadDirs.clear();
 		sessionHighRiskPrefixes.clear();
 		sessionAllowedDomains.clear();
-		pendingProtectedBashWriteApprovals.clear();
 		pendingOneShotAllowedDomains.clear();
 		for (const dir of defaultSessionReadDirs()) sessionReadDirs.add(dir);
 	}
@@ -951,6 +988,8 @@ export default function (pi: ExtensionAPI) {
 				version: 1,
 				dirs: Array.isArray(data.dirs) ? data.dirs.filter((v): v is string => typeof v === "string") : [],
 				readDirs: Array.isArray(data.readDirs) ? data.readDirs.filter((v): v is string => typeof v === "string") : [],
+				protectedDirs: Array.isArray(data.protectedDirs) ? data.protectedDirs.filter((v): v is string => typeof v === "string") : [],
+				protectedReadDirs: Array.isArray(data.protectedReadDirs) ? data.protectedReadDirs.filter((v): v is string => typeof v === "string") : [],
 				highRiskPrefixes: Array.isArray(data.highRiskPrefixes)
 					? data.highRiskPrefixes.filter((v): v is string => typeof v === "string")
 					: [],
@@ -963,6 +1002,8 @@ export default function (pi: ExtensionAPI) {
 		if (latest) {
 			for (const dir of await Promise.all(latest.dirs.map((dir) => normalizeDir(dir)))) sessionDirs.add(dir);
 			for (const dir of await Promise.all(latest.readDirs.map((dir) => normalizeDir(dir)))) sessionReadDirs.add(dir);
+			for (const dir of await Promise.all(latest.protectedDirs.map((dir) => normalizeDir(dir)))) sessionProtectedDirs.add(dir);
+			for (const dir of await Promise.all(latest.protectedReadDirs.map((dir) => normalizeDir(dir)))) sessionProtectedReadDirs.add(dir);
 			for (const prefix of latest.highRiskPrefixes.map((value) => normalizePrefix(value)).filter(Boolean)) {
 				sessionHighRiskPrefixes.add(prefix);
 			}
@@ -980,9 +1021,11 @@ export default function (pi: ExtensionAPI) {
 		const parts = [`${projectRoot}`];
 		const extraCount = currentExtraDirs().length;
 		const readCount = currentReadOnlyDirs().length;
+		const protectedCount = currentProtectedDirs().length + currentProtectedReadOnlyDirs().length;
 		const domainCount = currentRuleDomains().length;
 		if (extraCount > 0) parts.push(`+${extraCount} dirs`);
 		if (readCount > 0) parts.push(`+${readCount} read-only`);
+		if (protectedCount > 0) parts.push(`+${protectedCount} protected`);
 		if (domainCount > 0) parts.push(`+${domainCount} domains`);
 		parts.push("sockets unrestricted");
 		parts.push(isOsSandboxActive() ? "os sandbox" : `os off (${osSandboxReason})`);
@@ -997,17 +1040,24 @@ export default function (pi: ExtensionAPI) {
 		return unique([...configuredWriteRoots(), ...activeDirs(), execCwd, "/tmp", "/private/tmp"]);
 	}
 
-	function effectiveDenyRead(): string[] {
-		return unique([...(osSandboxConfig?.filesystem?.denyRead ?? []), ...sensitiveFilePaths]);
+	function parentIsDir(p: string): boolean {
+		if (!isAbsolute(p)) return true;
+		const parent = dirname(p);
+		try {
+			return statSync(parent).isDirectory();
+		} catch {
+			return false;
+		}
 	}
 
-	function effectiveDenyWrite(exemptProtectedIds: Iterable<string> = []): string[] {
-		const exempt = new Set(exemptProtectedIds);
+	function effectiveDenyRead(): string[] {
+		return unique([...(osSandboxConfig?.filesystem?.denyRead ?? [])]).filter(parentIsDir);
+	}
+
+	function effectiveDenyWrite(_exemptProtectedIds: Iterable<string> = []): string[] {
 		return unique([
 			...(osSandboxConfig?.filesystem?.denyWrite ?? []),
-			...sensitiveFilePaths,
-			...[...protectedPaths.entries()].filter(([, info]) => !exempt.has(info.id)).map(([path]) => path),
-		]);
+		]).filter(parentIsDir);
 	}
 
 	async function addProtectedPath(
@@ -1030,6 +1080,8 @@ export default function (pi: ExtensionAPI) {
 			{ id: resolve(projectRoot, ".pi", "extensions", "sandbox.ts"), label: "sandbox extension", path: resolve(projectRoot, ".pi", "extensions", "sandbox.ts") },
 			{ id: resolve(cwd, ".pi", "extensions", "sandbox.ts"), label: "sandbox extension", path: resolve(cwd, ".pi", "extensions", "sandbox.ts") },
 			{ id: resolve(AGENT_DIR, "extensions", "sandbox.ts"), label: "sandbox extension", path: resolve(AGENT_DIR, "extensions", "sandbox.ts") },
+			{ id: resolve(AGENT_DIR, "extensions", "sandbox", "index.ts"), label: "sandbox extension", path: resolve(AGENT_DIR, "extensions", "sandbox", "index.ts") },
+			{ id: resolve(AGENT_DIR, "extensions", "sandbox", "transient-menu.ts"), label: "sandbox extension", path: resolve(AGENT_DIR, "extensions", "sandbox", "transient-menu.ts") },
 			{ id: resolve(AGENT_DIR, "extensions", "agents.ts"), label: "agent extension", path: resolve(AGENT_DIR, "extensions", "agents.ts") },
 			{ id: resolve(AGENT_DIR, "extensions", "package.json"), label: "extension package manifest", path: resolve(AGENT_DIR, "extensions", "package.json") },
 			{ id: resolve(AGENT_DIR, "extensions", "package-lock.json"), label: "extension package lockfile", path: resolve(AGENT_DIR, "extensions", "package-lock.json") },
@@ -1096,27 +1148,25 @@ export default function (pi: ExtensionAPI) {
 			async exec(command, execCwd, options) {
 				if (!existsSync(execCwd)) throw new Error(`Working directory does not exist: ${execCwd}`);
 
-				const approvedProtectedWrites = toolCallId
-					? pendingProtectedBashWriteApprovals.get(toolCallId) ?? new Set<string>()
-					: new Set<string>();
 				const oneShotDomains = toolCallId
 					? pendingOneShotAllowedDomains.get(toolCallId) ?? new Set<string>()
 					: new Set<string>();
 				if (toolCallId) {
-					pendingProtectedBashWriteApprovals.delete(toolCallId);
 					pendingOneShotAllowedDomains.delete(toolCallId);
 				}
 
 				const baseRuntimeConfig = effectiveRuntimeConfig(execCwd);
-				const runtimeConfig = effectiveRuntimeConfig(execCwd, approvedProtectedWrites, oneShotDomains);
-				SandboxManager.updateConfig(runtimeConfig);
+				const runtimeConfig = effectiveRuntimeConfig(execCwd, [], oneShotDomains);
+				return await withSandboxRuntimeCwd(async () => {
+					SandboxManager.updateConfig(runtimeConfig);
 
-				try {
-					const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, runtimeConfig);
-					return await localBashOps.exec(wrappedCommand, execCwd, options);
-				} finally {
-					SandboxManager.updateConfig(baseRuntimeConfig);
-				}
+					try {
+						const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, runtimeConfig);
+						return await localBashOps.exec(wrappedCommand, execCwd, options);
+					} finally {
+						SandboxManager.updateConfig(baseRuntimeConfig);
+					}
+				});
 			},
 		};
 	}
@@ -1162,6 +1212,8 @@ export default function (pi: ExtensionAPI) {
 	async function normalizeRules(rules: RulesFile): Promise<void> {
 		rules.dirs = unique(await Promise.all(rules.dirs.map((dir) => normalizeDir(dir)))).sort();
 		rules.readDirs = unique(await Promise.all((rules.readDirs ?? []).map((dir) => normalizeDir(dir)))).sort();
+		rules.protectedDirs = unique(await Promise.all((rules.protectedDirs ?? []).map((dir) => normalizeDir(dir)))).sort();
+		rules.protectedReadDirs = unique(await Promise.all((rules.protectedReadDirs ?? []).map((dir) => normalizeDir(dir)))).sort();
 		rules.allowedDomains = unique((rules.allowedDomains ?? []).map((domain) => normalizeDomainPattern(domain)).filter(Boolean) as string[]).sort();
 	}
 
@@ -1228,6 +1280,85 @@ export default function (pi: ExtensionAPI) {
 			syncRuntimeBaseConfig();
 		}
 		return true;
+	}
+
+	async function addProtectedAllowedDir(dir: string, scope: AllowScope, level: AccessLevel, ctx?: { ui: any }): Promise<boolean> {
+		const normalized = await normalizeDir(dir);
+		let changed = false;
+		if (scope === "session") {
+			if (level === "full") {
+				sessionProtectedReadDirs.delete(normalized);
+				if (!sessionProtectedDirs.has(normalized)) {
+					sessionProtectedDirs.add(normalized);
+					changed = true;
+				}
+			} else if (!sessionProtectedDirs.has(normalized) && !sessionProtectedReadDirs.has(normalized)) {
+				sessionProtectedReadDirs.add(normalized);
+				changed = true;
+			}
+			if (changed) persistSessionState();
+		} else {
+			const rules = rulesForScope(scope);
+			if (level === "full") {
+				rules.protectedReadDirs = (rules.protectedReadDirs ?? []).filter((d) => d !== normalized);
+				if (!(rules.protectedDirs ?? []).includes(normalized)) {
+					const previous = {
+						dirs: [...rules.dirs],
+						readDirs: [...(rules.readDirs ?? [])],
+						protectedDirs: [...(rules.protectedDirs ?? [])],
+						protectedReadDirs: [...(rules.protectedReadDirs ?? [])],
+						allowedDomains: [...(rules.allowedDomains ?? [])],
+					};
+					rules.protectedDirs = rules.protectedDirs ?? [];
+					rules.protectedDirs.push(normalized);
+					rules.protectedDirs = unique(rules.protectedDirs).sort();
+					const saved = await saveForScope(scope, ctx);
+					if (!saved) {
+						rules.dirs = previous.dirs;
+						rules.readDirs = previous.readDirs;
+						rules.protectedDirs = previous.protectedDirs;
+						rules.protectedReadDirs = previous.protectedReadDirs;
+						rules.allowedDomains = previous.allowedDomains;
+						return false;
+					}
+					changed = true;
+				}
+			} else if (!(rules.protectedDirs ?? []).includes(normalized) && !(rules.protectedReadDirs ?? []).includes(normalized)) {
+				const previous = {
+					dirs: [...rules.dirs],
+					readDirs: [...(rules.readDirs ?? [])],
+					protectedDirs: [...(rules.protectedDirs ?? [])],
+					protectedReadDirs: [...(rules.protectedReadDirs ?? [])],
+					allowedDomains: [...(rules.allowedDomains ?? [])],
+				};
+				rules.protectedReadDirs = rules.protectedReadDirs ?? [];
+				rules.protectedReadDirs.push(normalized);
+				rules.protectedReadDirs = unique(rules.protectedReadDirs).sort();
+				const saved = await saveForScope(scope, ctx);
+				if (!saved) {
+					rules.dirs = previous.dirs;
+					rules.readDirs = previous.readDirs;
+					rules.protectedDirs = previous.protectedDirs;
+					rules.protectedReadDirs = previous.protectedReadDirs;
+					rules.allowedDomains = previous.allowedDomains;
+					return false;
+				}
+				changed = true;
+			}
+		}
+		return true;
+	}
+
+	function isProtectedPath(path: string): boolean {
+		return isSensitivePath(path) || protectedInfoForPath(path) !== undefined;
+	}
+
+	function isInsideProtectedAllowedDir(path: string): boolean {
+		return currentProtectedDirs().some((dir) => isInsideDir(path, dir));
+	}
+
+	function isInsideProtectedReadableDir(path: string): boolean {
+		return [...currentProtectedDirs(), ...currentProtectedReadOnlyDirs()].some((dir) => isInsideDir(path, dir));
 	}
 
 	async function addAllowedDomain(domain: string, scope: AllowScope, ctx?: { ui: any }): Promise<boolean> {
@@ -1336,98 +1467,151 @@ export default function (pi: ExtensionAPI) {
 		return { dir, kind: "directory", suggestions };
 	}
 
-	async function selectScope(ctx: { ui: any }, label: string): Promise<AllowScope | undefined> {
-		const choice = await ctx.ui.select(label, [
-			"This session",
-			"This project",
-			"All projects",
-			"Cancel",
-		]);
-		if (!choice || choice === "Cancel") return undefined;
-		return choice.startsWith("All") ? "global" : choice.startsWith("This project") ? "project" : "session";
+	// ── Transient menu helpers for prompt functions ──────────────────────────
+
+	type PathResult = "once" | "sr" | "Sf" | "pr" | "Pf" | "gr" | "Gf" | "custom" | "deny";
+	type DomainResult = "once" | "session" | "project" | "global" | "custom" | "deny";
+
+	function pathScopeLevel(result: string): { scope: AllowScope; level: AccessLevel } | undefined {
+		const map: Record<string, { scope: AllowScope; level: AccessLevel }> = {
+			sr: { scope: "session", level: "read" }, Sf: { scope: "session", level: "full" },
+			pr: { scope: "project", level: "read" }, Pf: { scope: "project", level: "full" },
+			gr: { scope: "global", level: "read" },  Gf: { scope: "global", level: "full" },
+		};
+		return map[result];
 	}
 
-	async function chooseDifferentPath(
-		ctx: { ui: any; hasUI?: boolean },
-		boundary: AccessBoundary,
-	): Promise<{ dir: string; level: AccessLevel; scope: AllowScope } | undefined> {
-		const pathOptions = [...boundary.suggestions.map((s) => `${s.label}: ${s.dir}`), "Enter a custom path", "Cancel"];
-		const pathChoice = await ctx.ui.select("Choose a path to grant access to:", pathOptions);
-		if (!pathChoice || pathChoice === "Cancel") return undefined;
+	function domainScope(result: string): AllowScope | undefined {
+		const map: Record<string, AllowScope> = { session: "session", project: "project", global: "global" };
+		return map[result];
+	}
 
-		let dir: string;
-		if (pathChoice === "Enter a custom path") {
-			const entered = await ctx.ui.input("Directory to allow:", boundary.dir);
-			if (!entered?.trim()) return undefined;
-			dir = await normalizeAllowedDir(entered.trim());
+	function buildPathSections(showReadColumn: boolean): MenuSection<PathResult>[] {
+		const sections: MenuSection<PathResult>[] = [
+			{ type: "row", bindings: [{ key: "y", label: "once", value: "once" }] },
+			{ type: "spacer" },
+		];
+		if (showReadColumn) {
+			sections.push({
+				type: "matrix",
+				columns: ["read", "full"],
+				rows: [
+					{ label: "session", cells: [{ key: "s", label: "", value: "sr" }, { key: "S", label: "", value: "Sf" }] },
+					{ label: "project", cells: [{ key: "p", label: "", value: "pr" }, { key: "P", label: "", value: "Pf" }] },
+					{ label: "global",  cells: [{ key: "g", label: "", value: "gr" }, { key: "G", label: "", value: "Gf" }] },
+				],
+			});
 		} else {
-			const matched = boundary.suggestions.find((s) => pathChoice === `${s.label}: ${s.dir}`);
-			if (!matched) return undefined;
-			dir = matched.dir;
+			sections.push({
+				type: "row",
+				bindings: [
+					{ key: "S", label: "session", value: "Sf" },
+					{ key: "P", label: "project", value: "Pf" },
+					{ key: "G", label: "global", value: "Gf" },
+				],
+			});
 		}
+		return sections;
+	}
 
-		const levelChoice = await ctx.ui.select(`Choose the path access to grant for ${dir}:`, ["Read path access", "Full path access (read + write)", "Cancel"]);
-		if (!levelChoice || levelChoice === "Cancel") return undefined;
-		const level: AccessLevel = levelChoice.startsWith("Full") ? "full" : "read";
-
-		const scope = await selectScope(ctx, `Allow ${level === "full" ? "full access to" : "reading"} ${dir} for:`);
-		if (!scope) return undefined;
-		return { dir, level, scope };
+	function buildPathSubSections(showReadColumn: boolean): MenuSection<PathResult>[] {
+		if (showReadColumn) {
+			return [{
+				type: "matrix",
+				columns: ["read", "full"],
+				rows: [
+					{ label: "session", cells: [{ key: "s", label: "", value: "sr" }, { key: "S", label: "", value: "Sf" }] },
+					{ label: "project", cells: [{ key: "p", label: "", value: "pr" }, { key: "P", label: "", value: "Pf" }] },
+					{ label: "global",  cells: [{ key: "g", label: "", value: "gr" }, { key: "G", label: "", value: "Gf" }] },
+				],
+			}];
+		}
+		return [{
+			type: "row",
+			bindings: [
+				{ key: "S", label: "session", value: "Sf" },
+				{ key: "P", label: "project", value: "Pf" },
+				{ key: "G", label: "global", value: "Gf" },
+			],
+		}];
 	}
 
 	async function promptBoundaryAccess(
 		ctx: { ui: any; hasUI?: boolean },
-		header: string,
+		operation: string,
+		path: string,
 		boundary: AccessBoundary,
 		allowPersistent = true,
+		protectedMode = false,
 	): Promise<{ block: boolean; reason?: string } | undefined> {
 		if (!ctx.hasUI) return { block: true, reason: `${boundary.kind} access blocked (no UI): ${boundary.dir}` };
 
 		const suggested = boundary.suggestions[0];
-		const suggestedLabel = `${suggested.label}: ${suggested.dir}`;
-		const READ_OPT = `Grant read path access to ${suggestedLabel}...`;
-		const FULL_OPT = `Grant full path access to ${suggestedLabel}...`;
-		const DIFFERENT_OPT = "Choose a different path to grant access to...";
-		const options = allowPersistent
-			? ["Grant this command only", READ_OPT, FULL_OPT, DIFFERENT_OPT, "Deny"]
-			: ["Grant this command only", "Deny"];
-		const choice = await ctx.ui.select(
-			allowPersistent
-				? `${header}\n\nSuggested path grant: ${suggestedLabel}`
-				: `${header}\n\nSuggested path grant: ${suggestedLabel}\n\nSensitive paths can only be granted for this command only.`,
-			options,
-		);
+		const showRead = operation === "READ" || operation === "BASH";
 
-		if (choice === "Grant this command only") return undefined;
-
-		let selectedDir: string | undefined;
-		let selectedScope: AllowScope | undefined;
-		let selectedLevel: AccessLevel | undefined;
-
-		if (choice === READ_OPT || choice === FULL_OPT) {
-			selectedLevel = choice === FULL_OPT ? "full" : "read";
-			const scopeLabel = selectedLevel === "full"
-				? `Grant full path access to ${suggestedLabel} for:`
-				: `Grant read path access to ${suggestedLabel} for:`;
-			selectedScope = await selectScope(ctx, scopeLabel);
-			if (!selectedScope) return { block: true, reason: "User cancelled scope selection" };
-			selectedDir = suggested.dir;
-		} else if (choice === DIFFERENT_OPT) {
-			const result = await chooseDifferentPath(ctx, boundary);
-			if (!result) return { block: true, reason: "User cancelled path selection" };
-			selectedDir = result.dir;
-			selectedScope = result.scope;
-			selectedLevel = result.level;
+		if (!allowPersistent) {
+			const result = await showTransient(ctx, {
+				title: "Sandbox",
+				context: [`${operation}  ${path}`, `→  ${suggested.dir}  (${suggested.label})`, "sensitive — once only"],
+				sections: [{ type: "row", bindings: [{ key: "y", label: "allow this command", value: "allow" as const }] }],
+				cancelValue: "deny" as const,
+			});
+			return result === "allow" ? undefined : { block: true, reason: `User denied access to ${boundary.dir}` };
 		}
 
-		if (selectedDir && selectedScope && selectedLevel) {
-			const saved = await addAllowedDir(selectedDir, selectedScope, selectedLevel, ctx);
-			if (!saved) return { block: true, reason: "Could not persist sandbox access" };
-			updateStatus(ctx);
-			return undefined;
-		}
+		let grace = 500;
+		while (true) {
+			const result = await showTransient<PathResult>(ctx, {
+				title: "Sandbox",
+				context: protectedMode
+					? [`${operation}  ${path}`, `→  ${suggested.dir}  (${suggested.label})`, "protected path"]
+					: [`${operation}  ${path}`, `→  ${suggested.dir}  (${suggested.label})`],
+				sections: buildPathSections(showRead),
+				footer: [{ key: "e", label: "custom path", value: "custom" }],
+				cancelValue: "deny",
+				grace,
+			});
+			grace = 0;
 
-		return { block: true, reason: `User denied access to ${boundary.dir}` };
+			if (result === "once") return undefined;
+			if (result === "deny") return { block: true, reason: `User denied access to ${boundary.dir}` };
+
+			const sl = pathScopeLevel(result);
+			if (sl) {
+				const saved = protectedMode
+					? await addProtectedAllowedDir(suggested.dir, sl.scope, sl.level, ctx)
+					: await addAllowedDir(suggested.dir, sl.scope, sl.level, ctx);
+				if (!saved) return { block: true, reason: "Could not persist sandbox access" };
+				updateStatus(ctx);
+				return undefined;
+			}
+
+			if (result === "custom") {
+				const entered = await ctx.ui.input("Path:", suggested.dir);
+				if (!entered?.trim()) continue;
+				const dir = await normalizeAllowedDir(entered.trim());
+
+				const subResult = await showTransient<PathResult>(ctx, {
+					title: "Sandbox",
+					context: protectedMode ? [`custom  ${dir}`, "protected path"] : [`custom  ${dir}`],
+					sections: buildPathSubSections(showRead),
+					cancelLabel: "back",
+					cancelValue: "deny",
+					grace: 0,
+				});
+				if (subResult === "deny") continue;
+
+				const subSl = pathScopeLevel(subResult);
+				if (subSl) {
+					const saved = protectedMode
+						? await addProtectedAllowedDir(dir, subSl.scope, subSl.level, ctx)
+						: await addAllowedDir(dir, subSl.scope, subSl.level, ctx);
+					if (!saved) return { block: true, reason: "Could not persist sandbox access" };
+					updateStatus(ctx);
+					return undefined;
+				}
+			}
+		}
 	}
 
 	async function promptDomainAccess(
@@ -1443,68 +1627,68 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!ctx.hasUI) return { block: true, reason: `Domain blocked (no UI): ${domain}` };
 
-		const ALLOW_ONCE = `Grant ${domain} for this command only`;
-		const ALLOW_SESSION = `Grant ${domain} for this session`;
-		const ALLOW_PROJECT = `Grant ${domain} for this project`;
-		const ALLOW_GLOBAL = `Grant ${domain} for all projects`;
-		const CUSTOM = "Choose a different domain or pattern...";
-		const choice = await ctx.ui.select(
-			`Bash wants network access to:\n\n  ${domain}\n\n(in: ${command})\n\nGrant: network access to this domain.`,
-			[ALLOW_ONCE, ALLOW_SESSION, ALLOW_PROJECT, ALLOW_GLOBAL, CUSTOM, "Deny"],
-		);
-
-		if (choice === ALLOW_ONCE) return { block: false, oneShotPatterns: [domain] };
-		if (choice === ALLOW_SESSION || choice === ALLOW_PROJECT || choice === ALLOW_GLOBAL) {
-			const scope: AllowScope = choice === ALLOW_SESSION ? "session" : choice === ALLOW_PROJECT ? "project" : "global";
-			const saved = await addAllowedDomain(domain, scope, ctx);
-			if (!saved) return { block: true, reason: `Could not persist domain access for ${domain}` };
-			updateStatus(ctx);
-			return { block: false };
+		async function handleDomainResult(result: DomainResult, target: string): Promise<{ block: boolean; reason?: string; oneShotPatterns?: string[] } | undefined> {
+			if (result === "once") return { block: false, oneShotPatterns: [target] };
+			const scope = domainScope(result);
+			if (scope) {
+				const saved = await addAllowedDomain(target, scope, ctx);
+				if (!saved) return { block: true, reason: `Could not persist domain access for ${target}` };
+				updateStatus(ctx);
+				return { block: false };
+			}
+			return { block: true, reason: `User denied domain access to ${domain}` };
 		}
-		if (choice === CUSTOM) {
-			const entered = await ctx.ui.input("Domain or pattern to grant (e.g. example.com or *.example.com):", domain);
+
+		const domainBindings: Binding<DomainResult>[] = [
+			{ key: "y", label: "once", value: "once" },
+			{ key: "s", label: "session", value: "session" },
+			{ key: "p", label: "project", value: "project" },
+			{ key: "g", label: "global", value: "global" },
+		];
+
+		let grace = 500;
+		while (true) {
+			const result = await showTransient<DomainResult>(ctx, {
+				title: "Sandbox",
+				context: [`BASH  ${domain}`, `in  ${command}`],
+				sections: [{ type: "row", bindings: domainBindings }],
+				footer: [{ key: "e", label: "custom pattern", value: "custom" }],
+				cancelValue: "deny",
+				grace,
+			});
+			grace = 0;
+
+			if (result !== "custom") return handleDomainResult(result, domain);
+
+			const entered = await ctx.ui.input("Domain or pattern:", domain);
 			const normalized = normalizeDomainPattern(entered?.trim() ?? "");
-			if (!normalized) return { block: true, reason: "Invalid domain or pattern" };
-			const scopeChoice = await ctx.ui.select(`Grant ${normalized} for:`, [
-				"This command only",
-				"This session",
-				"This project",
-				"All projects",
-				"Cancel",
-			]);
-			if (!scopeChoice || scopeChoice === "Cancel") return { block: true, reason: "User cancelled domain selection" };
-			if (scopeChoice === "This command only") return { block: false, oneShotPatterns: [normalized] };
-			const scope: AllowScope = scopeChoice.startsWith("All")
-				? "global"
-				: scopeChoice.startsWith("This project")
-					? "project"
-					: "session";
-			const saved = await addAllowedDomain(normalized, scope, ctx);
-			if (!saved) return { block: true, reason: `Could not persist domain access for ${normalized}` };
-			updateStatus(ctx);
-			return { block: false };
-		}
+			if (!normalized) { if (!entered?.trim()) continue; ctx.ui.notify("Invalid domain or pattern", "warning"); continue; }
 
-		return { block: true, reason: `User denied domain access to ${domain}` };
+			const subResult = await showTransient<DomainResult>(ctx, {
+				title: "Sandbox",
+				context: [`custom  ${normalized}`],
+				sections: [{ type: "row", bindings: domainBindings }],
+				cancelLabel: "back",
+				cancelValue: "deny",
+				grace: 0,
+			});
+			if (subResult === "deny") continue;
+			return handleDomainResult(subResult, normalized);
+		}
 	}
 
 
-	async function confirmSensitiveAccess(
+	async function ensureProtectedPathAccess(
 		ctx: { ui: any; hasUI?: boolean },
 		kind: string,
 		path: string,
-		context?: string,
 	): Promise<{ block: boolean; reason?: string } | undefined> {
-		if (!isSensitivePath(path)) return undefined;
-		if (!ctx.hasUI) return { block: true, reason: `${kind} sensitive path blocked (no UI): ${path}` };
-
-		const header = context
-			? `Sensitive ${kind} request:\n\n  ${path}\n\n(in: ${context})\n\nGrant: ${kind} access to this path for this command only?`
-			: `Sensitive ${kind} request:\n\n  ${path}\n\nGrant: ${kind} access to this path for this command only?`;
-
-		const choice = await ctx.ui.select(header, ["Grant this command only", "Deny"]);
-		if (choice === "Grant this command only") return undefined;
-		return { block: true, reason: `Blocked sensitive ${kind}: ${path}` };
+		if (!isProtectedPath(path)) return undefined;
+		const operation = kind.toUpperCase();
+		if ((operation === "READ" || operation === "BASH") && isInsideProtectedReadableDir(path)) return undefined;
+		if (operation !== "READ" && operation !== "BASH" && isInsideProtectedAllowedDir(path)) return undefined;
+		const boundary = await accessBoundary(path);
+		return promptBoundaryAccess(ctx, operation, path, boundary, true, true);
 	}
 
 	async function ensureFileAccess(
@@ -1521,9 +1705,10 @@ export default function (pi: ExtensionAPI) {
 
 		return promptBoundaryAccess(
 			ctx,
-			`${toolName.toUpperCase()} outside allowed dirs:\n\n  ${resolved}`,
+			toolName.toUpperCase(),
+			resolved,
 			boundary,
-			!isSensitivePath(resolved),
+			true,
 		);
 	}
 
@@ -1553,49 +1738,33 @@ export default function (pi: ExtensionAPI) {
 		return unique(resolved);
 	}
 
-	async function confirmProtectedWriteAccess(
-		ctx: { ui: any; hasUI?: boolean },
-		kind: string,
-		path: string,
-		label: string,
-		context?: string,
-	): Promise<{ block: boolean; reason?: string } | undefined> {
-		if (!ctx.hasUI) return { block: true, reason: `${kind} protected path blocked (no UI): ${path}` };
-
-		const header = context
-			? `The model wants to modify the ${label} via ${kind.toUpperCase()}:\n\n  ${path}\n\n(in: ${context})\n\nGrant: full path access to this protected path for this command only?`
-			: `The model wants to modify the ${label}:\n\n  ${path}\n\nGrant: full path access to this protected path for this command only?`;
-
-		const choice = await ctx.ui.select(header, ["Grant this command only", "Deny"]);
-		if (choice === "Grant this command only") return undefined;
-		return { block: true, reason: `Blocked modification of ${label}` };
-	}
 
 	async function ensureBashPathsAllowed(
 		command: string,
 		ctx: { ui: any; hasUI?: boolean; cwd: string },
-		exemptProtectedIds: Iterable<string> = [],
 	): Promise<{ block: boolean; reason?: string } | undefined> {
-		const exempt = new Set(exemptProtectedIds);
+		const exempt = new Set<string>();
 		const candidates = await resolveCommandPathCandidates(command, ctx.cwd);
 		const promptedBoundaries = new Set<string>();
 
 		for (const path of candidates) {
 			const protectedInfo = protectedInfoForPath(path);
 			if (protectedInfo && exempt.has(protectedInfo.id)) continue;
-			const sensitive = await confirmSensitiveAccess(ctx, "bash", path, command);
-			if (sensitive?.block) return sensitive;
+			const protectedAccess = await ensureProtectedPathAccess(ctx, "bash", path);
+			if (protectedAccess?.block) return protectedAccess;
 		}
 
 		for (const path of candidates) {
 			const protectedInfo = protectedInfoForPath(path);
 			if (protectedInfo && exempt.has(protectedInfo.id)) continue;
+			if (isProtectedPath(path)) continue;
 			if (isInsideReadableDir(path)) continue;
 			const boundary = await accessBoundary(path);
 			if (isInsideReadableDir(boundary.dir) || promptedBoundaries.has(boundary.dir)) continue;
 			const result = await promptBoundaryAccess(
 				ctx,
-				`Bash wants to access a ${boundary.kind} outside allowed dirs:\n\n  ${boundary.dir}\n\n(in: ${command})`,
+				"BASH",
+				boundary.dir,
 				boundary,
 			);
 			if (result?.block) return result;
@@ -1625,22 +1794,6 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	async function confirmProtectedBashWrites(
-		command: string,
-		ctx: { ui: any; hasUI?: boolean; cwd: string },
-	): Promise<{ block: boolean; reason?: string; approvedIds?: string[] } | undefined> {
-		const targets = await resolveWriteTargetCandidates(command, ctx.cwd);
-		const infos = protectedInfosForPaths(targets);
-		if (infos.length === 0) return undefined;
-
-		for (const info of infos) {
-			const ok = await confirmProtectedWriteAccess(ctx, "bash", info.id, info.label, command);
-			if (ok?.block) return ok;
-		}
-
-		return { block: false, approvedIds: infos.map((info) => info.id) };
-	}
-
 	function isHighRiskApprovedForSession(segment: string): boolean {
 		for (const prefix of sessionHighRiskPrefixes) {
 			if (matchesCommandPrefix(segment, prefix)) return true;
@@ -1656,23 +1809,34 @@ export default function (pi: ExtensionAPI) {
 		if (risks.length === 0) return undefined;
 		if (!ctx.hasUI) return { block: true, reason: `High-risk bash blocked (no UI): ${command}` };
 
+		type HRResult = "once" | "approve" | "edit" | "deny";
+
 		for (const { segment, reasons } of risks) {
 			if (isHighRiskApprovedForSession(segment)) continue;
 			const suggestedPrefix = defaultHighRiskPrefix(segment);
-			const ALLOW_PREFIX_OPT = `Grant high-risk command prefix "${suggestedPrefix}" for this session`;
-			const CUSTOM_PREFIX_OPT = "Grant a different high-risk command prefix for this session...";
-			const choice = await ctx.ui.select(
-				`High-risk bash command:\n\n  ${segment}\n\n(in: ${command})\n\nWhy this needs approval:\n  - ${reasons.join("\n  - ")}\n\nGrant: this high-risk command for this command only, or a high-risk command prefix for this session.`,
-				["Grant this command only", ALLOW_PREFIX_OPT, CUSTOM_PREFIX_OPT, "Deny"],
-			);
-			if (choice === "Grant this command only") continue;
-			if (choice === ALLOW_PREFIX_OPT) {
+
+			const result = await showTransient<HRResult>(ctx, {
+				title: "Sandbox",
+				context: [
+					`BASH  ${segment}`,
+					...reasons.map((r) => `·  ${r}`),
+				],
+				sections: [
+					{ type: "row", bindings: [{ key: "y", label: "allow once", value: "once" }] },
+					{ type: "row", bindings: [{ key: "a", label: `approve "${suggestedPrefix}" for session`, value: "approve" }] },
+					{ type: "row", bindings: [{ key: "e", label: "edit prefix to approve", value: "edit" }] },
+				],
+				cancelValue: "deny",
+			});
+
+			if (result === "once") continue;
+			if (result === "approve") {
 				sessionHighRiskPrefixes.add(suggestedPrefix);
 				persistSessionState();
 				continue;
 			}
-			if (choice === CUSTOM_PREFIX_OPT) {
-				const entered = await ctx.ui.editor("Edit the high-risk command prefix to grant for this session (single line):", suggestedPrefix);
+			if (result === "edit") {
+				const entered = await ctx.ui.editor("Edit prefix:", suggestedPrefix);
 				const prefix = normalizePrefix(entered?.trim() ?? "");
 				if (!prefix) return { block: true, reason: "Blocked by user" };
 				sessionHighRiskPrefixes.add(prefix);
@@ -1782,8 +1946,10 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`OS sandbox not supported on ${process.platform}`, "warning");
 		} else {
 			try {
-				try { await SandboxManager.reset(); } catch { /* ignore stale state */ }
-				await SandboxManager.initialize(effectiveRuntimeConfig(cwd));
+				await withSandboxRuntimeCwd(async () => {
+					try { await SandboxManager.reset(); } catch { /* ignore stale state */ }
+					await SandboxManager.initialize(effectiveRuntimeConfig(cwd));
+				});
 				osSandboxEnabled = true;
 				osSandboxInitialized = true;
 				osSandboxReason = "active";
@@ -1807,11 +1973,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_shutdown", async () => {
-		pendingProtectedBashWriteApprovals.clear();
 		pendingOneShotAllowedDomains.clear();
 		if (!osSandboxInitialized) return;
 		try {
-			await SandboxManager.reset();
+			await withSandboxRuntimeCwd(() => SandboxManager.reset());
 		} catch {
 			// Ignore cleanup errors
 		} finally {
@@ -1829,14 +1994,10 @@ export default function (pi: ExtensionAPI) {
 			let resolved = resolvePath(rawPath, ctx.cwd);
 			try { resolved = await realpath(resolved); } catch { /* new file */ }
 
-			if (toolName === "write" || toolName === "edit") {
-				const protectedInfo = protectedInfoForPath(resolved);
-				if (protectedInfo) return confirmProtectedWriteAccess(ctx, toolName, resolved, protectedInfo.label);
-			}
-
-			const sensitive = await confirmSensitiveAccess(ctx, toolName, resolved);
-			if (sensitive?.block) return sensitive;
+			const protectedAccess = await ensureProtectedPathAccess(ctx, toolName, resolved);
+			if (protectedAccess?.block) return protectedAccess;
 			noteSensitivePath(resolved);
+			if (isProtectedPath(resolved)) return undefined;
 
 			const access = await ensureFileAccess(toolName, resolved, ctx);
 			if (access?.block) return access;
@@ -1859,11 +2020,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const protectedWrite = await confirmProtectedBashWrites(command, ctx);
-			if (protectedWrite?.block) return protectedWrite;
-			const approvedProtectedIds = protectedWrite?.approvedIds ?? [];
-
-			const pathAccess = await ensureBashPathsAllowed(command, ctx, approvedProtectedIds);
+			const pathAccess = await ensureBashPathsAllowed(command, ctx);
 			if (pathAccess?.block) return pathAccess;
 
 			const domainAccess = await ensureBashDomainsAllowed(event.toolCallId, command, ctx);
@@ -1871,10 +2028,6 @@ export default function (pi: ExtensionAPI) {
 
 			const highRisk = await confirmHighRiskBash(command, ctx);
 			if (highRisk?.block) return highRisk;
-
-			if (approvedProtectedIds.length > 0) {
-				pendingProtectedBashWriteApprovals.set(event.toolCallId, new Set(approvedProtectedIds));
-			}
 			return undefined;
 		}
 
@@ -1953,6 +2106,22 @@ export default function (pi: ExtensionAPI) {
 				...formatSection("Global full access", globalRules.dirs),
 				"",
 				...formatSection("Global read-only", globalRules.readDirs ?? []),
+				"",
+				...formatSection("Protected full access", currentProtectedDirs()),
+				"",
+				...formatSection("Protected read-only", currentProtectedReadOnlyDirs()),
+				"",
+				...formatSection("Session protected full", [...sessionProtectedDirs].sort()),
+				"",
+				...formatSection("Session protected read-only", [...sessionProtectedReadDirs].sort()),
+				"",
+				...formatSection("Project protected full", projectRules.protectedDirs ?? []),
+				"",
+				...formatSection("Project protected read-only", projectRules.protectedReadDirs ?? []),
+				"",
+				...formatSection("Global protected full", globalRules.protectedDirs ?? []),
+				"",
+				...formatSection("Global protected read-only", globalRules.protectedReadDirs ?? []),
 				"",
 				...formatSection("Session allowed domains", [...sessionAllowedDomains].sort()),
 				"",
