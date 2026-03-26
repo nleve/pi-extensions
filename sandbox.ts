@@ -80,6 +80,7 @@ const DIRECT_WRITE_COMMANDS = new Set([
 	"cp", "mv", "rm", "touch", "tee", "chmod", "chown", "ln", "install", "truncate", "dd",
 ]);
 const SENSITIVE_SCAN_PRUNE_DIRS = [".git", "node_modules", ".next", "dist", "build", "target", ".venv", "venv"];
+const IMPLICIT_BASH_READ_PATHS = ["/dev/null", "/dev/tty", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -798,7 +799,7 @@ export default function (pi: ExtensionAPI) {
 	let lastPersistedSessionStateJson = "";
 
 	function defaultSessionReadDirs(): string[] {
-		return [AGENT_DIR];
+		return [AGENT_DIR, ...IMPLICIT_BASH_READ_PATHS];
 	}
 
 	function isOsSandboxActive(): boolean {
@@ -864,14 +865,17 @@ export default function (pi: ExtensionAPI) {
 			allowPty?: boolean;
 			seccomp?: { bpfPath?: string; applyPath?: string };
 		};
+		const networkConfig = {
+			...(base.network ?? { allowedDomains: [], deniedDomains: [] }),
+			allowLocalBinding: base.network?.allowLocalBinding,
+			allowedDomains: effectiveAllowedDomains(extraDomains) ?? [],
+			deniedDomains: effectiveDeniedDomains(),
+			allowUnixSockets: undefined,
+			allowAllUnixSockets: true,
+		};
 
 		return {
-			network: {
-				...(base.network ?? { allowedDomains: [], deniedDomains: [] }),
-				allowLocalBinding: base.network?.allowLocalBinding,
-				allowedDomains: effectiveAllowedDomains(extraDomains) ?? [],
-				deniedDomains: effectiveDeniedDomains(),
-			},
+			network: networkConfig as SandboxRuntimeConfig["network"],
 			filesystem: {
 				...(base.filesystem ?? { denyRead: [], allowWrite: [], denyWrite: [] }),
 				denyRead: effectiveDenyRead(),
@@ -980,6 +984,7 @@ export default function (pi: ExtensionAPI) {
 		if (extraCount > 0) parts.push(`+${extraCount} dirs`);
 		if (readCount > 0) parts.push(`+${readCount} read-only`);
 		if (domainCount > 0) parts.push(`+${domainCount} domains`);
+		parts.push("sockets unrestricted");
 		parts.push(isOsSandboxActive() ? "os sandbox" : `os off (${osSandboxReason})`);
 		ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", parts.join(" · ")));
 	}
@@ -1110,9 +1115,6 @@ export default function (pi: ExtensionAPI) {
 					const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, runtimeConfig);
 					return await localBashOps.exec(wrappedCommand, execCwd, options);
 				} finally {
-					// The sandbox runtime's proxy filter reads global manager config rather than
-					// per-command wrap config. Restore the steady-state config after each tool call
-					// so one-shot domain or protected-write exceptions do not leak to later commands.
 					SandboxManager.updateConfig(baseRuntimeConfig);
 				}
 			},
@@ -1262,6 +1264,7 @@ export default function (pi: ExtensionAPI) {
 		syncRuntimeBaseConfig();
 		return true;
 	}
+
 
 	function boundaryKindLabel(kind: AccessBoundaryKind): string {
 		if (kind === "package") return "package directory";
@@ -1484,6 +1487,7 @@ export default function (pi: ExtensionAPI) {
 
 		return { block: true, reason: `User denied domain access to ${domain}` };
 	}
+
 
 	async function confirmSensitiveAccess(
 		ctx: { ui: any; hasUI?: boolean },
@@ -1712,7 +1716,7 @@ export default function (pi: ExtensionAPI) {
 		return { operations: createSandboxedBashOps() };
 	});
 
-	async function initializeProjectState(ctx: { cwd: string; ui: any }) {
+	async function initializeProjectState(ctx: { cwd: string; ui: any; sessionManager: any }) {
 		cwd = ctx.cwd;
 		globalRulesPath = resolve(AGENT_DIR, "sandbox-rules.json");
 		globalConfigPath = resolve(AGENT_DIR, "sandbox.json");
@@ -1968,6 +1972,7 @@ export default function (pi: ExtensionAPI) {
 				"Network:",
 				`  Configured allowed domains: ${configuredDomainsLabel}`,
 				`  Effective allowed domains: ${effectiveDomainsLabel}`,
+				"  Unix sockets: unrestricted",
 				`  Denied domains: ${effectiveDeniedDomains().join(", ") || "(none)"}`,
 				`  Local binding: ${osSandboxConfig?.network?.allowLocalBinding ? "allowed" : "blocked"}`,
 			];
