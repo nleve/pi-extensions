@@ -31,7 +31,7 @@
 
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import {
@@ -812,17 +812,8 @@ export default function (pi: ExtensionAPI) {
 		return osSandboxEnabled && osSandboxInitialized;
 	}
 
-	async function prepareSandboxRuntimeCwd(): Promise<void> {
-		await mkdir(SANDBOX_RUNTIME_CWD, { recursive: true });
-		for (const name of [".git", ".claude"]) {
-			const path = resolve(SANDBOX_RUNTIME_CWD, name);
-			if (existsSync(path) && !statSync(path).isDirectory()) await rm(path, { force: true });
-			await mkdir(path, { recursive: true });
-		}
-	}
-
 	async function withSandboxRuntimeCwd<T>(fn: () => Promise<T> | T): Promise<T> {
-		await prepareSandboxRuntimeCwd();
+		await mkdir(SANDBOX_RUNTIME_CWD, { recursive: true });
 		const previousCwd = process.cwd();
 		process.chdir(SANDBOX_RUNTIME_CWD);
 		try {
