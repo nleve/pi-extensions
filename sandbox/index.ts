@@ -107,20 +107,21 @@ export default function (pi: ExtensionAPI) {
 	let currentAgentName: string | undefined;
 	let lastPersistedSessionStateJson = "";
 
-	const combined = (...groups: Array<Iterable<string> | undefined>) => unique(groups.flatMap((group) => group ? [...group] : []));
+	// Derived views over project/global/session sandbox state.
+	const mergeUnique = (...groups: Array<Iterable<string> | undefined>) => unique(groups.flatMap((group) => group ? [...group] : []));
 	const normalizeDir = (input: string) => normalizeDirInput(input, projectRoot || cwd || process.cwd());
 	const normalizeAllowedDir = (input: string) => normalizeAllowedDirInput(input, projectRoot || cwd || process.cwd());
-	const currentExtraDirs = () => combined(globalRules.dirs, projectRules.dirs, session.dirs);
-	const currentReadOnlyDirs = () => combined(globalRules.readDirs, projectRules.readDirs, session.readDirs);
-	const currentProtectedDirs = () => combined(globalRules.protectedDirs, projectRules.protectedDirs, session.protectedDirs);
-	const currentProtectedReadOnlyDirs = () => combined(globalRules.protectedReadDirs, projectRules.protectedReadDirs, session.protectedReadDirs);
-	const activeDirs = () => combined([projectRoot], currentExtraDirs());
-	const readableDirs = () => combined(activeDirs(), currentReadOnlyDirs());
-	const currentRuleDomains = () => combined(globalRules.allowedDomains, projectRules.allowedDomains, session.allowedDomains);
+	const currentFullAccessDirs = () => mergeUnique(globalRules.dirs, projectRules.dirs, session.dirs);
+	const currentReadOnlyDirs = () => mergeUnique(globalRules.readDirs, projectRules.readDirs, session.readDirs);
+	const currentProtectedDirs = () => mergeUnique(globalRules.protectedDirs, projectRules.protectedDirs, session.protectedDirs);
+	const currentProtectedReadOnlyDirs = () => mergeUnique(globalRules.protectedReadDirs, projectRules.protectedReadDirs, session.protectedReadDirs);
+	const activeDirs = () => mergeUnique([projectRoot], currentFullAccessDirs());
+	const readableDirs = () => mergeUnique(activeDirs(), currentReadOnlyDirs());
+	const currentRuleDomains = () => mergeUnique(globalRules.allowedDomains, projectRules.allowedDomains, session.allowedDomains);
 	const configuredAllowedDomains = () => osSandboxConfig?.network?.allowedDomains;
 	const configuredWriteRoots = () => osSandboxConfig?.filesystem?.allowWrite ?? [];
-	const defaultReadDirs = () => defaultSessionReadDirs(AGENT_DIR);
-	const isProtected = (path: string) => isSensitivePath(path, SENSITIVE_EXACT_FILES) || protectedInfoForPath(protectedPaths, path) !== undefined;
+	const sessionDefaultReadDirs = defaultSessionReadDirs(AGENT_DIR);
+	const isProtectedPath = (path: string) => isSensitivePath(path, SENSITIVE_EXACT_FILES) || protectedInfoForPath(protectedPaths, path) !== undefined;
 	const rulesForScope = (scope: Scope) => scope === "project" ? projectRules : globalRules;
 	const pathsForScope = (scope: Scope) => scope === "project" ? projectRulesPath : globalRulesPath;
 
@@ -142,15 +143,15 @@ export default function (pi: ExtensionAPI) {
 	function effectiveAllowedDomains(extraPatterns: Iterable<string> = []): string[] | undefined {
 		const configured = configuredAllowedDomains();
 		if (configured === undefined) return undefined;
-		return combined(configured, currentRuleDomains(), extraPatterns).map((pattern) => normalizeDomainPattern(pattern) ?? pattern).filter(Boolean).sort();
+		return mergeUnique(configured, currentRuleDomains(), extraPatterns).map((pattern) => normalizeDomainPattern(pattern) ?? pattern).filter(Boolean).sort();
 	}
 
 	function effectiveDeniedDomains(): string[] {
-		return combined(osSandboxConfig?.network?.deniedDomains ?? []).map((pattern) => normalizeDomainPattern(pattern) ?? pattern).filter(Boolean).sort();
+		return mergeUnique(osSandboxConfig?.network?.deniedDomains ?? []).map((pattern) => normalizeDomainPattern(pattern) ?? pattern).filter(Boolean).sort();
 	}
 
 	function effectiveWriteRoots(execCwd: string): string[] {
-		return combined(configuredWriteRoots(), activeDirs(), [execCwd, "/tmp", "/private/tmp"]);
+		return mergeUnique(configuredWriteRoots(), activeDirs(), [execCwd, "/tmp", "/private/tmp"]);
 	}
 
 	function parentIsDir(path: string): boolean {
@@ -163,13 +164,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function effectiveDenyRead(): string[] {
-		return combined(osSandboxConfig?.filesystem?.denyRead ?? []).filter(parentIsDir);
+		return mergeUnique(osSandboxConfig?.filesystem?.denyRead ?? []).filter(parentIsDir);
 	}
 
 	function effectiveDenyWrite(): string[] {
-		return combined(osSandboxConfig?.filesystem?.denyWrite ?? []).filter(parentIsDir);
+		return mergeUnique(osSandboxConfig?.filesystem?.denyWrite ?? []).filter(parentIsDir);
 	}
 
+	// Compose the live OS-sandbox config from static config plus learned permissions.
 	function effectiveRuntimeConfig(execCwd: string, extraDomains: Iterable<string> = []): SandboxRuntimeConfig {
 		const base = osSandboxConfig ?? createDefaultSandboxConfig(projectRoot);
 		const extended = base as SandboxConfig & {
@@ -233,11 +235,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function isInsideProtectedReadableDir(path: string): boolean {
-		return combined(currentProtectedDirs(), currentProtectedReadOnlyDirs()).some((dir) => isInsideDir(path, dir));
+		return mergeUnique(currentProtectedDirs(), currentProtectedReadOnlyDirs()).some((dir) => isInsideDir(path, dir));
 	}
 
 	function persistSessionState(): void {
-		const payload = buildSessionStateData(session, defaultReadDirs());
+		const payload = buildSessionStateData(session, sessionDefaultReadDirs);
 		const json = JSON.stringify(payload);
 		if (json === lastPersistedSessionStateJson) return;
 		pi.appendEntry(SANDBOX_STATE_CUSTOM_TYPE, payload);
@@ -245,7 +247,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function resetSessionState(): void {
-		resetSessionSets(session, defaultReadDirs());
+		resetSessionSets(session, sessionDefaultReadDirs);
 		pendingOneShotAllowedDomains.clear();
 	}
 
@@ -254,7 +256,7 @@ export default function (pi: ExtensionAPI) {
 		lastPersistedSessionStateJson = await restoreSessionState(
 			ctx.sessionManager.getBranch(),
 			session,
-			defaultReadDirs(),
+			sessionDefaultReadDirs,
 			normalizeDir,
 			normalizePrefix,
 		);
@@ -264,13 +266,19 @@ export default function (pi: ExtensionAPI) {
 
 	function updateStatus(ctx: { ui: any }) {
 		const parts = [projectRoot];
-		if (currentExtraDirs().length) parts.push(`+${currentExtraDirs().length} dirs`);
+		if (currentFullAccessDirs().length) parts.push(`+${currentFullAccessDirs().length} dirs`);
 		if (currentReadOnlyDirs().length) parts.push(`+${currentReadOnlyDirs().length} read-only`);
 		const protectedCount = currentProtectedDirs().length + currentProtectedReadOnlyDirs().length;
 		if (protectedCount) parts.push(`+${protectedCount} protected`);
 		if (currentRuleDomains().length) parts.push(`+${currentRuleDomains().length} domains`);
 		parts.push("sockets unrestricted", isOsSandboxActive() ? "os sandbox" : `os off (${osSandboxReason})`);
 		ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", parts.join(" · ")));
+	}
+
+	function disableOsSandbox(reason: string): void {
+		osSandboxEnabled = false;
+		osSandboxInitialized = false;
+		osSandboxReason = reason;
 	}
 
 	async function saveRulesForScope(scope: Scope, ctx?: { ui: any }): Promise<boolean> {
@@ -284,16 +292,27 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function snapshotRules(rules: RulesFile): RulesFile {
-		return {
+	// Apply a mutation to persisted rules and roll it back if saving fails.
+	async function persistRuleMutation(
+		scope: Scope,
+		ctx: { ui: any } | undefined,
+		mutate: (rules: RulesFile) => boolean,
+	): Promise<{ ok: boolean; changed: boolean }> {
+		const rules = rulesForScope(scope);
+		const before: RulesFile = {
 			dirs: [...rules.dirs],
 			readDirs: [...(rules.readDirs ?? [])],
 			protectedDirs: [...(rules.protectedDirs ?? [])],
 			protectedReadDirs: [...(rules.protectedReadDirs ?? [])],
 			allowedDomains: [...(rules.allowedDomains ?? [])],
 		};
+		if (!mutate(rules)) return { ok: true, changed: false };
+		if (await saveRulesForScope(scope, ctx)) return { ok: true, changed: true };
+		Object.assign(rules, before);
+		return { ok: false, changed: false };
 	}
 
+	// Full access subsumes read-only; persisted scopes save atomically with rollback.
 	async function addDirPermission(kind: "normal" | "protected", dir: string, scope: AllowScope, level: AccessLevel, ctx?: { ui: any }): Promise<boolean> {
 		const normalized = await normalizeDir(dir);
 		const sessionFull = kind === "normal" ? session.dirs : session.protectedDirs;
@@ -311,23 +330,21 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (changed) persistSessionState();
 		} else {
-			const rules = rulesForScope(scope);
-			const before = snapshotRules(rules);
-			const full = [...(rules[fullKey] ?? [])] as string[];
-			const read = [...(rules[readKey] ?? [])] as string[];
-			if (level === "full") {
-				rules[readKey] = read.filter((value) => value !== normalized) as never;
-				if (full.includes(normalized)) return true;
-				rules[fullKey] = unique([...full, normalized]).sort() as never;
-			} else {
-				if (full.includes(normalized) || read.includes(normalized)) return true;
+			const result = await persistRuleMutation(scope, ctx, (rules) => {
+				const full = [...(rules[fullKey] ?? [])] as string[];
+				const read = [...(rules[readKey] ?? [])] as string[];
+				if (level === "full") {
+					if (full.includes(normalized)) return false;
+					rules[readKey] = read.filter((value) => value !== normalized) as never;
+					rules[fullKey] = unique([...full, normalized]).sort() as never;
+					return true;
+				}
+				if (full.includes(normalized) || read.includes(normalized)) return false;
 				rules[readKey] = unique([...read, normalized]).sort() as never;
-			}
-			if (!await saveRulesForScope(scope, ctx)) {
-				Object.assign(rules, before);
-				return false;
-			}
-			changed = true;
+				return true;
+			});
+			if (!result.ok) return false;
+			changed = result.changed;
 		}
 		if (changed && kind === "normal") sensitiveFilePaths = await refreshSensitiveFilePaths(pi, activeDirs());
 		if (changed && (kind === "normal" || scope !== "session")) syncRuntimeBaseConfig();
@@ -350,18 +367,17 @@ export default function (pi: ExtensionAPI) {
 			syncRuntimeBaseConfig();
 			return true;
 		}
-		const rules = rulesForScope(scope);
-		if ((rules.allowedDomains ?? []).includes(normalized)) return true;
-		const before = snapshotRules(rules);
-		rules.allowedDomains = unique([...(rules.allowedDomains ?? []), normalized]).sort();
-		if (!await saveRulesForScope(scope, ctx)) {
-			Object.assign(rules, before);
-			return false;
-		}
-		syncRuntimeBaseConfig();
+		const result = await persistRuleMutation(scope, ctx, (rules) => {
+			if ((rules.allowedDomains ?? []).includes(normalized)) return false;
+			rules.allowedDomains = unique([...(rules.allowedDomains ?? []), normalized]).sort();
+			return true;
+		});
+		if (!result.ok) return false;
+		if (result.changed) syncRuntimeBaseConfig();
 		return true;
 	}
 
+	// Protect sandbox config/rules and the extension's own source files from silent modification.
 	async function rebuildControlPaths(): Promise<void> {
 		const sandboxFiles = ["index.ts", "policy.ts", "state.ts", "prompts.ts", "transient-menu.ts"];
 		const sandboxRoots = [
@@ -414,7 +430,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function ensureProtectedPathAccess(ctx: { ui: any; hasUI?: boolean }, kind: string, path: string, extraContext: string[] = []) {
-		if (!isProtected(path)) return;
+		if (!isProtectedPath(path)) return;
 		const operation = kind.toUpperCase();
 		if ((operation === "READ" || operation === "BASH") && isInsideProtectedReadableDir(path)) return;
 		if (operation !== "READ" && operation !== "BASH" && isInsideProtectedAllowedDir(path)) return;
@@ -439,13 +455,14 @@ export default function (pi: ExtensionAPI) {
 		return unique(await Promise.all(extractPathLikeTokens(command).map((token) => realpathIfExists(resolvePath(token, commandCwd)))));
 	}
 
+	// UX-layer path approval for bash; the OS sandbox is still the hard enforcement boundary.
 	async function ensureBashPathsAllowed(command: string, ctx: { ui: any; hasUI?: boolean; cwd: string }) {
 		const promptedBoundaries = new Set<string>();
 		for (const path of await resolveCommandPathCandidates(command, ctx.cwd)) {
 			const extraContext = [`in  ${command}`];
 			const protectedAccess = await ensureProtectedPathAccess(ctx, "bash", path, extraContext);
 			if (protectedAccess?.block) return protectedAccess;
-			if (isProtected(path) || isInsideReadableDir(path)) continue;
+			if (isProtectedPath(path) || isInsideReadableDir(path)) continue;
 			const boundary = await accessBoundary(path, { normalizeDir, findRepoRoot });
 			if (isInsideReadableDir(boundary.dir) || promptedBoundaries.has(boundary.dir)) continue;
 			const result = await promptBoundaryAccess(ctx, "BASH", path, boundary, { extraContext, addAllowedDir, addProtectedAllowedDir, normalizeAllowedDir, updateStatus });
@@ -535,10 +552,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await initializeProjectState(ctx);
 		const noOsSandbox = pi.getFlag("no-os-sandbox") as boolean;
-		if (noOsSandbox) osSandboxReason = "--no-os-sandbox";
-		else if (!osSandboxConfig?.enabled) osSandboxReason = "config disabled";
+		if (noOsSandbox) disableOsSandbox("--no-os-sandbox");
+		else if (!osSandboxConfig?.enabled) disableOsSandbox("config disabled");
 		else if (!["darwin", "linux"].includes(process.platform)) {
-			osSandboxReason = process.platform;
+			disableOsSandbox(process.platform);
 			ctx.ui.notify(`OS sandbox not supported on ${process.platform}`, "warning");
 		} else {
 			try {
@@ -551,13 +568,9 @@ export default function (pi: ExtensionAPI) {
 				osSandboxReason = "active";
 				ctx.ui.notify("OS sandbox initialized for bash", "info");
 			} catch (error) {
-				osSandboxReason = "init failed";
+				disableOsSandbox("init failed");
 				ctx.ui.notify(`OS sandbox initialization failed: ${error instanceof Error ? error.message : error}`, "warning");
 			}
-		}
-		if (osSandboxReason !== "active") {
-			osSandboxEnabled = false;
-			osSandboxInitialized = false;
 		}
 		updateStatus(ctx);
 	});
@@ -586,7 +599,7 @@ export default function (pi: ExtensionAPI) {
 			const protectedAccess = await ensureProtectedPathAccess(ctx, event.toolName, resolved);
 			if (protectedAccess?.block) return protectedAccess;
 			sensitiveFilePaths = noteSensitivePath(resolved, sensitiveFilePaths, (path) => isSensitivePath(path, SENSITIVE_EXACT_FILES));
-			if (isProtected(resolved)) return;
+			if (isProtectedPath(resolved)) return;
 			return ensureFileAccess(event.toolName as "read" | "write" | "edit", resolved, ctx);
 		}
 		if (event.toolName !== "bash") return;

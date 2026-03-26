@@ -61,6 +61,7 @@ export async function promptBoundaryAccess(
 	const suggested = boundary.suggestions[0];
 	const showRead = operation === "READ" || operation === "BASH";
 	const allowPersistent = deps.allowPersistent !== false;
+	const persistDir = deps.protectedMode ? deps.addProtectedAllowedDir : deps.addAllowedDir;
 	const context = [`${operation}  ${path}`, ...(deps.extraContext ?? []), `→  ${suggested.dir}  (${suggested.label})`];
 	if (!allowPersistent) {
 		const result = await showTransient(ctx, {
@@ -86,9 +87,7 @@ export async function promptBoundaryAccess(
 		if (result === "deny") return { block: true, reason: `User denied access to ${boundary.dir}` };
 		const selection = pathScopeLevel(result);
 		if (selection) {
-			const saved = deps.protectedMode
-				? await deps.addProtectedAllowedDir(suggested.dir, selection.scope, selection.level, ctx)
-				: await deps.addAllowedDir(suggested.dir, selection.scope, selection.level, ctx);
+			const saved = await persistDir(suggested.dir, selection.scope, selection.level, ctx);
 			if (!saved) return { block: true, reason: "Could not persist sandbox access" };
 			deps.updateStatus(ctx);
 			return undefined;
@@ -108,9 +107,7 @@ export async function promptBoundaryAccess(
 		if (subResult === "deny") continue;
 		const subSelection = pathScopeLevel(subResult);
 		if (!subSelection) continue;
-		const saved = deps.protectedMode
-			? await deps.addProtectedAllowedDir(dir, subSelection.scope, subSelection.level, ctx)
-			: await deps.addAllowedDir(dir, subSelection.scope, subSelection.level, ctx);
+		const saved = await persistDir(dir, subSelection.scope, subSelection.level, ctx);
 		if (!saved) return { block: true, reason: "Could not persist sandbox access" };
 		deps.updateStatus(ctx);
 		return undefined;
