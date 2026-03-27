@@ -27,6 +27,9 @@ import {
 	unique,
 } from "./policy";
 import { confirmHighRiskBash, promptBoundaryAccess, promptDomainAccess } from "./prompts";
+import { showTransient, withPanelUI, titleRule, bottomRule, pad, hintsLine, LPAD } from "./transient-menu";
+import { matchesKey, Key, visibleWidth, truncateToWidth, CombinedAutocompleteProvider, Editor, Container, Text, type Focusable, type Component } from "@mariozechner/pi-tui";
+import { getSelectListTheme } from "@mariozechner/pi-coding-agent";
 import {
 	buildSessionStateData,
 	createDefaultSandboxConfig,
@@ -265,14 +268,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: { ui: any }) {
-		const parts = [projectRoot];
+		const parts: string[] = [];
 		if (currentFullAccessDirs().length) parts.push(`+${currentFullAccessDirs().length} dirs`);
 		if (currentReadOnlyDirs().length) parts.push(`+${currentReadOnlyDirs().length} read-only`);
 		const protectedCount = currentProtectedDirs().length + currentProtectedReadOnlyDirs().length;
 		if (protectedCount) parts.push(`+${protectedCount} protected`);
 		if (currentRuleDomains().length) parts.push(`+${currentRuleDomains().length} domains`);
-		parts.push("sockets unrestricted", isOsSandboxActive() ? "os sandbox" : `os off (${osSandboxReason})`);
-		ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", parts.join(" · ")));
+		if (!isOsSandboxActive()) parts.push(`os sandbox off (${osSandboxReason})`);
+		ctx.ui.setStatus("sandbox", parts.length ? ctx.ui.theme.fg("accent", parts.join(" · ")) : "");
 	}
 
 	function disableOsSandbox(reason: string): void {
@@ -374,6 +377,60 @@ export default function (pi: ExtensionAPI) {
 		});
 		if (!result.ok) return false;
 		if (result.changed) syncRuntimeBaseConfig();
+		return true;
+	}
+
+	async function removeDirPermission(kind: "normal" | "protected", dir: string, scope: AllowScope, level: AccessLevel, ctx?: { ui: any }): Promise<boolean> {
+		const normalized = await normalizeDir(dir);
+		const sessionFull = kind === "normal" ? session.dirs : session.protectedDirs;
+		const sessionRead = kind === "normal" ? session.readDirs : session.protectedReadDirs;
+		const fullKey = kind === "normal" ? "dirs" : "protectedDirs";
+		const readKey = kind === "normal" ? "readDirs" : "protectedReadDirs";
+		let changed = false;
+		if (scope === "session") {
+			const target = level === "full" ? sessionFull : sessionRead;
+			if (!target.has(normalized)) return false;
+			target.delete(normalized);
+			changed = true;
+			persistSessionState();
+		} else {
+			const result = await persistRuleMutation(scope, ctx, (rules) => {
+				const key = level === "full" ? fullKey : readKey;
+				const arr = [...(rules[key] ?? [])] as string[];
+				const idx = arr.indexOf(normalized);
+				if (idx === -1) return false;
+				arr.splice(idx, 1);
+				rules[key] = arr as never;
+				return true;
+			});
+			if (!result.ok || !result.changed) return false;
+			changed = true;
+		}
+		if (changed && kind === "normal") sensitiveFilePaths = await refreshSensitiveFilePaths(pi, activeDirs());
+		if (changed) syncRuntimeBaseConfig();
+		return true;
+	}
+
+	async function removeAllowedDomain(domain: string, scope: AllowScope, ctx?: { ui: any }): Promise<boolean> {
+		const normalized = normalizeDomainPattern(domain);
+		if (!normalized) return false;
+		if (scope === "session") {
+			if (!session.allowedDomains.has(normalized)) return false;
+			session.allowedDomains.delete(normalized);
+			persistSessionState();
+			syncRuntimeBaseConfig();
+			return true;
+		}
+		const result = await persistRuleMutation(scope, ctx, (rules) => {
+			const arr = [...(rules.allowedDomains ?? [])];
+			const idx = arr.indexOf(normalized);
+			if (idx === -1) return false;
+			arr.splice(idx, 1);
+			rules.allowedDomains = arr;
+			return true;
+		});
+		if (!result.ok || !result.changed) return false;
+		syncRuntimeBaseConfig();
 		return true;
 	}
 
@@ -624,95 +681,383 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
+	// ── Sandbox management UI ────────────────────────────────────────────────
+
+	interface MgmtEntry {
+		value: string;
+		displayValue: string;
+		scope: AllowScope;
+		isProtected: boolean;
+		remove: () => Promise<boolean>;
+	}
+
+	interface MgmtCategory {
+		label: string;
+		entries: MgmtEntry[];
+	}
+
+	function abbreviateHome(path: string): string {
+		const home = process.env.HOME || process.env.USERPROFILE;
+		return home && path.startsWith(home) ? "~" + path.slice(home.length) : path;
+	}
+
+	function collectMgmtEntries(): MgmtCategory[] {
+		const categories: MgmtCategory[] = [];
+		const defaults = new Set(defaultSessionReadDirs(AGENT_DIR));
+
+		const fullEntries: MgmtEntry[] = [];
+		const addFull = (dirs: Iterable<string>, scope: AllowScope, prot: boolean) => {
+			for (const dir of dirs) fullEntries.push({
+				value: dir, displayValue: abbreviateHome(dir), scope, isProtected: prot,
+				remove: () => removeDirPermission(prot ? "protected" : "normal", dir, scope, "full"),
+			});
+		};
+		addFull(session.dirs, "session", false);
+		addFull(projectRules.dirs, "project", false);
+		addFull(globalRules.dirs, "global", false);
+		addFull(session.protectedDirs, "session", true);
+		addFull(projectRules.protectedDirs ?? [], "project", true);
+		addFull(globalRules.protectedDirs ?? [], "global", true);
+		if (fullEntries.length) categories.push({ label: "Full access", entries: fullEntries });
+
+		const readEntries: MgmtEntry[] = [];
+		const addRead = (dirs: Iterable<string>, scope: AllowScope, prot: boolean) => {
+			for (const dir of dirs) {
+				if (scope === "session" && defaults.has(dir)) continue;
+				readEntries.push({
+					value: dir, displayValue: abbreviateHome(dir), scope, isProtected: prot,
+					remove: () => removeDirPermission(prot ? "protected" : "normal", dir, scope, "read"),
+				});
+			}
+		};
+		addRead(session.readDirs, "session", false);
+		addRead(projectRules.readDirs ?? [], "project", false);
+		addRead(globalRules.readDirs ?? [], "global", false);
+		addRead(session.protectedReadDirs, "session", true);
+		addRead(projectRules.protectedReadDirs ?? [], "project", true);
+		addRead(globalRules.protectedReadDirs ?? [], "global", true);
+		if (readEntries.length) categories.push({ label: "Read-only", entries: readEntries });
+
+		const domainEntries: MgmtEntry[] = [];
+		const addDom = (doms: Iterable<string>, scope: AllowScope) => {
+			for (const dom of doms) domainEntries.push({
+				value: dom, displayValue: dom, scope, isProtected: false,
+				remove: () => removeAllowedDomain(dom, scope),
+			});
+		};
+		addDom(session.allowedDomains, "session");
+		addDom(projectRules.allowedDomains ?? [], "project");
+		addDom(globalRules.allowedDomains ?? [], "global");
+		if (domainEntries.length) categories.push({ label: "Domains", entries: domainEntries });
+
+		return categories;
+	}
+
+	function flatEntries(categories: MgmtCategory[]): MgmtEntry[] {
+		return categories.flatMap((c) => c.entries);
+	}
+
+	function renderMgmtEntry(entry: MgmtEntry, isSelected: boolean, width: number, theme: any): string {
+		const marker = isSelected ? theme.fg("accent", "▸") + " " : "  ";
+		const protTag = entry.isProtected ? theme.fg("dim", " (protected)") : "";
+		const scopeStr = theme.fg("dim", entry.scope);
+		const scopeVW = visibleWidth(scopeStr);
+
+		const pathStr = isSelected ? entry.displayValue : theme.fg("muted", entry.displayValue);
+
+		const left = " ".repeat(LPAD) + marker + pathStr + protTag;
+		const leftVW = visibleWidth(left);
+		const gap = Math.max(2, width - leftVW - scopeVW);
+		return truncateToWidth(left + " ".repeat(gap) + scopeStr, width);
+	}
+
+	async function showSandboxManager(ctx: any): Promise<string | null> {
+		return withPanelUI<string | null>(ctx, (tui: any, theme: any, _kb: any, done: (v: string | null) => void) => {
+			let categories = collectMgmtEntries();
+			let flat = flatEntries(categories);
+			let selected = 0;
+			let busy = false;
+			let cachedWidth: number | undefined;
+			let cachedLines: string[] | undefined;
+
+			return {
+				handleInput(data: string) {
+					if (busy) return;
+					if (matchesKey(data, Key.escape)) { done(null); return; }
+					if ((matchesKey(data, Key.up) || data === "k" || matchesKey(data, Key.ctrl("p"))) && selected > 0) {
+						selected--;
+					} else if ((matchesKey(data, Key.down) || data === "j" || matchesKey(data, Key.ctrl("n"))) && selected < flat.length - 1) {
+						selected++;
+					} else if ((data === "d" || matchesKey(data, Key.backspace)) && flat.length > 0) {
+						const entry = flat[selected];
+						busy = true;
+						entry.remove().then((ok) => {
+							if (ok) {
+								categories = collectMgmtEntries();
+								flat = flatEntries(categories);
+								selected = Math.min(selected, Math.max(0, flat.length - 1));
+								updateStatus(ctx);
+							}
+							busy = false;
+							cachedWidth = undefined;
+							cachedLines = undefined;
+							tui.requestRender();
+						});
+						return;
+					} else if (data === "a") { done("add"); return; }
+					else if (data === "c" && flat.length > 0) { done("clear"); return; }
+					else { return; }
+					cachedWidth = undefined;
+					cachedLines = undefined;
+					tui.requestRender();
+				},
+
+				render(width: number): string[] {
+					if (cachedLines && cachedWidth === width) return cachedLines;
+
+					const border = (s: string) => theme.fg("border", s);
+					const title = (s: string) => theme.fg("accent", theme.bold(s));
+					const accent = (s: string) => theme.fg("accent", s);
+					const dim = (s: string) => theme.fg("dim", s);
+
+					const lines: string[] = [];
+					lines.push(titleRule(width, "Sandbox", border, title));
+
+					if (flat.length === 0) {
+						lines.push(pad(dim("No permissions configured."), width));
+					} else {
+						let idx = 0;
+						for (let ci = 0; ci < categories.length; ci++) {
+							const cat = categories[ci];
+							lines.push(pad(theme.fg("text", cat.label), width));
+							for (const entry of cat.entries) {
+								lines.push(renderMgmtEntry(entry, idx === selected, width, theme));
+								idx++;
+							}
+							if (ci < categories.length - 1) lines.push("");
+						}
+					}
+
+					lines.push("");
+					const osStatus = isOsSandboxActive() ? "on" : `off (${osSandboxReason})`;
+					lines.push(pad(dim(`OS sandbox: ${osStatus}`), width));
+
+					lines.push("");
+					const left = flat.length > 0
+						? `${accent("a")}  ${dim("add")}   ${accent("d")}  ${dim("remove")}   ${accent("c")}  ${dim("clear all")}`
+						: `${accent("a")}  ${dim("add")}`;
+					const right = `${accent("ESC")}  ${dim("close")}`;
+					lines.push(hintsLine(left, right, width));
+					lines.push(bottomRule(width, border));
+
+					cachedWidth = width;
+					cachedLines = lines;
+					return lines;
+				},
+
+				invalidate() {
+					cachedWidth = undefined;
+					cachedLines = undefined;
+				},
+			};
+		});
+	}
+
+	async function pathInput(ctx: any, title: string, defaultValue: string): Promise<string | undefined> {
+		return withPanelUI<string | undefined>(ctx, (tui: any, theme: any, _kb: any, done: (v: string | undefined) => void) => {
+			const editorTheme = { borderColor: (s: string) => theme.fg("borderMuted", s), selectList: getSelectListTheme() };
+			const editor = new Editor(tui, editorTheme, { paddingX: 1 });
+			// Path-only autocomplete provider — always treats input as a filesystem path,
+			// bypassing the slash-command detection in CombinedAutocompleteProvider.
+			const inner = new CombinedAutocompleteProvider([], cwd);
+			const pathProvider = {
+				getSuggestions(lines: string[], cursorLine: number, cursorCol: number) {
+					const currentLine = lines[cursorLine] || "";
+					const textBeforeCursor = currentLine.slice(0, cursorCol);
+					const suggestions = (inner as any).getFileSuggestions(textBeforeCursor);
+					if (!suggestions || suggestions.length === 0) return null;
+					return { items: suggestions, prefix: textBeforeCursor };
+				},
+				applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: any, prefix: string) {
+					return inner.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+				},
+				getForceFileSuggestions(lines: string[], cursorLine: number, cursorCol: number) {
+					return pathProvider.getSuggestions(lines, cursorLine, cursorCol);
+				},
+				shouldTriggerFileCompletion() { return true; },
+			};
+			editor.setAutocompleteProvider(pathProvider as any);
+			if (defaultValue) editor.setText(defaultValue);
+			editor.onSubmit = (text: string) => done(text || undefined);
+
+			const container = new Container();
+			const titleText = new Text(theme.fg("accent", ` ${title}`), 0, 0);
+			container.addChild(titleText);
+			container.addChild(editor);
+			const hints = new Text(theme.fg("dim", " enter submit  tab complete  esc cancel"), 0, 0);
+			container.addChild(hints);
+
+			const comp: Component & Focusable = {
+				focused: false,
+				render(w: number) { return container.render(w); },
+				invalidate() { container.invalidate(); },
+				handleInput(data: string) {
+					if (matchesKey(data, Key.escape)) { done(undefined); return; }
+					editor.handleInput(data);
+				},
+			};
+			Object.defineProperty(comp, "focused", {
+				get() { return editor.focused; },
+				set(v: boolean) { editor.focused = v; },
+			});
+			return comp;
+		});
+	}
+
+	async function sandboxAddFlow(ctx: any): Promise<void> {
+		const type = await showTransient<string | null>(ctx, {
+			title: "Add",
+			context: [],
+			sections: [{
+				type: "row",
+				bindings: [
+					{ key: "f", label: "full access dir", value: "dir-full" },
+					{ key: "r", label: "read-only dir", value: "dir-read" },
+					{ key: "d", label: "domain", value: "domain" },
+				],
+			}],
+			cancelValue: null,
+			cancelLabel: "back",
+			grace: 0,
+		});
+		if (!type) return;
+
+		let entered: string | undefined;
+		if (type === "domain") {
+			entered = await ctx.ui.input("Domain or pattern:", "") ?? undefined;
+		} else {
+			entered = await pathInput(ctx, "Path:", cwd);
+		}
+		if (!entered?.trim()) return;
+
+		const scope = await showTransient<AllowScope | null>(ctx, {
+			title: "Scope",
+			context: [entered.trim()],
+			sections: [{
+				type: "row",
+				bindings: [
+					{ key: "s", label: "session", value: "session" as AllowScope },
+					{ key: "p", label: "project", value: "project" as AllowScope },
+					{ key: "g", label: "global", value: "global" as AllowScope },
+				],
+			}],
+			cancelValue: null,
+			cancelLabel: "back",
+			grace: 0,
+		});
+		if (!scope) return;
+
+		if (type === "domain") {
+			await addAllowedDomain(entered.trim(), scope, ctx);
+		} else {
+			const level: AccessLevel = type === "dir-full" ? "full" : "read";
+			const dir = await normalizeAllowedDir(entered.trim());
+			await addAllowedDir(dir, scope, level, ctx);
+		}
+		updateStatus(ctx);
+	}
+
+	async function sandboxClearFlow(ctx: any): Promise<void> {
+		const scope = await showTransient<string | null>(ctx, {
+			title: "Clear",
+			context: ["Remove all sandbox permissions"],
+			sections: [{
+				type: "row",
+				bindings: [
+					{ key: "s", label: "session only", value: "session" },
+					{ key: "p", label: "project rules", value: "project" },
+					{ key: "g", label: "global rules", value: "global" },
+					{ key: "a", label: "all", value: "all" },
+				],
+			}],
+			cancelValue: null,
+			cancelLabel: "back",
+			grace: 0,
+		});
+		if (!scope) return;
+
+		if (scope === "project" || scope === "all") { projectRules = emptyRules(); await saveRulesForScope("project", ctx); }
+		if (scope === "global" || scope === "all") { globalRules = emptyRules(); await saveRulesForScope("global", ctx); }
+		if (scope === "session" || scope === "all") {
+			resetSessionState();
+			persistSessionState();
+		}
+		sensitiveFilePaths = await refreshSensitiveFilePaths(pi, activeDirs());
+		syncRuntimeBaseConfig(ctx.cwd);
+		updateStatus(ctx);
+	}
+
 	pi.registerCommand("sandbox", {
-		description: "Show sandbox status. Usage: /sandbox [clear]",
+		description: "Manage sandbox permissions",
 		handler: async (args, ctx) => {
-			if (args?.trim() === "clear") {
-				const scope = await ctx.ui.select("Clear which approved sandbox access?", ["Project rules only", "Global rules only", "Both", "Cancel"]);
-				if (scope === "Project rules only" || scope === "Both") { projectRules = emptyRules(); await saveRulesForScope("project", ctx); }
-				if (scope === "Global rules only" || scope === "Both") { globalRules = emptyRules(); await saveRulesForScope("global", ctx); }
-				if (scope !== "Cancel") {
-					resetSessionState();
-					persistSessionState();
-					sensitiveFilePaths = await refreshSensitiveFilePaths(pi, activeDirs());
-					syncRuntimeBaseConfig(ctx.cwd);
-					updateStatus(ctx);
-					ctx.ui.notify("Sandbox access cleared.", "info");
+			// Debug dump for troubleshooting
+			if (args?.trim() === "debug") {
+				const formatSection = (label: string, values: string[]) => values.length ? [label + ":", ...values.map((value) => `  - ${value}`)] : [`${label}: (none)`];
+				const configuredDomains = configuredAllowedDomains();
+				const effectiveDomains = effectiveAllowedDomains();
+				const configuredDomainsLabel = configuredDomains === undefined ? "(unrestricted)" : configuredDomains.length ? configuredDomains.join(", ") : "(blocked unless explicitly allowed)";
+				const effectiveDomainsLabel = effectiveDomains === undefined ? "(unrestricted)" : effectiveDomains.length ? effectiveDomains.join(", ") : "(blocked)";
+				const lines = [
+					`Project root: ${projectRoot}`,
+					`OS sandbox: ${isOsSandboxActive() ? "enabled" : `off (${osSandboxReason})`}`,
+					`Global rules:  ${globalRulesPath}`,
+					`Project rules: ${projectRulesPath}`,
+					`Global config: ${globalConfigPath}`,
+					`Project config: ${projectConfigPath}`,
+					"",
+					...formatSection("Full access dirs", activeDirs()),
+					...formatSection("Read-only dirs", currentReadOnlyDirs()),
+					...formatSection("Protected full access", currentProtectedDirs()),
+					...formatSection("Protected read-only", currentProtectedReadOnlyDirs()),
+					"",
+					...formatSection("Session allowed domains", [...session.allowedDomains].sort()),
+					...formatSection("Project allowed domains", projectRules.allowedDomains ?? []),
+					...formatSection("Global allowed domains", globalRules.allowedDomains ?? []),
+					"",
+					"Filesystem:",
+					`  Effective deny read: ${effectiveDenyRead().join(", ") || "(none)"}`,
+					`  Sensitive files: ${sensitiveFilePaths.length}`,
+					`  Effective allow write: ${effectiveWriteRoots(cwd).join(", ")}`,
+					`  Effective deny write: ${effectiveDenyWrite().join(", ") || "(none)"}`,
+					"",
+					"Network:",
+					`  Configured: ${configuredDomainsLabel}`,
+					`  Effective: ${effectiveDomainsLabel}`,
+					`  Denied: ${effectiveDeniedDomains().join(", ") || "(none)"}`,
+				];
+				if (session.highRiskPrefixes.size) {
+					lines.push("", `High-risk prefixes (${session.highRiskPrefixes.size}):`);
+					for (const prefix of [...session.highRiskPrefixes].sort()) lines.push(`  ${prefix}`);
 				}
+				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
-			const formatSection = (label: string, values: string[]) => values.length ? [label + ":", ...values.map((value) => `  - ${value}`)] : [`${label}: (none)`];
-			const configuredDomains = configuredAllowedDomains();
-			const effectiveDomains = effectiveAllowedDomains();
-			const configuredDomainsLabel = configuredDomains === undefined ? "(unrestricted)" : configuredDomains.length ? configuredDomains.join(", ") : "(blocked unless explicitly allowed)";
-			const effectiveDomainsLabel = effectiveDomains === undefined ? "(unrestricted)" : effectiveDomains.length ? effectiveDomains.join(", ") : "(blocked)";
-			const lines = [
-				`Project root: ${projectRoot}`,
-				`OS sandbox: ${isOsSandboxActive() ? "enabled" : `off (${osSandboxReason})`}`,
-				`Global rules:  ${globalRulesPath}`,
-				`Project rules: ${projectRulesPath}`,
-				`Global config: ${globalConfigPath}`,
-				`Project config: ${projectConfigPath}`,
-				"",
-				...formatSection("Full access dirs", activeDirs()),
-				"",
-				...formatSection("Read-only dirs", currentReadOnlyDirs()),
-				"",
-				...formatSection("Session full access", [...session.dirs].sort()),
-				"",
-				...formatSection("Session read-only", [...session.readDirs].sort()),
-				"",
-				...formatSection("Project full access", projectRules.dirs),
-				"",
-				...formatSection("Project read-only", projectRules.readDirs ?? []),
-				"",
-				...formatSection("Global full access", globalRules.dirs),
-				"",
-				...formatSection("Global read-only", globalRules.readDirs ?? []),
-				"",
-				...formatSection("Protected full access", currentProtectedDirs()),
-				"",
-				...formatSection("Protected read-only", currentProtectedReadOnlyDirs()),
-				"",
-				...formatSection("Session protected full", [...session.protectedDirs].sort()),
-				"",
-				...formatSection("Session protected read-only", [...session.protectedReadDirs].sort()),
-				"",
-				...formatSection("Project protected full", projectRules.protectedDirs ?? []),
-				"",
-				...formatSection("Project protected read-only", projectRules.protectedReadDirs ?? []),
-				"",
-				...formatSection("Global protected full", globalRules.protectedDirs ?? []),
-				"",
-				...formatSection("Global protected read-only", globalRules.protectedReadDirs ?? []),
-				"",
-				...formatSection("Session allowed domains", [...session.allowedDomains].sort()),
-				"",
-				...formatSection("Project allowed domains", projectRules.allowedDomains ?? []),
-				"",
-				...formatSection("Global allowed domains", globalRules.allowedDomains ?? []),
-				"",
-				"Filesystem:",
-				`  Base deny read: ${osSandboxConfig?.filesystem?.denyRead?.join(", ") || "(none)"}`,
-				`  Effective deny read: ${effectiveDenyRead().join(", ") || "(none)"}`,
-				`  Discovered sensitive files: ${sensitiveFilePaths.length}`,
-				`  Configured allow write: ${configuredWriteRoots().join(", ") || "(none)"}`,
-				`  Effective allow write roots: ${effectiveWriteRoots(cwd).join(", ")}`,
-				`  Effective deny write: ${effectiveDenyWrite().join(", ") || "(none)"}`,
-				`  Protected sandbox control files: ${protectedControlFiles(protectedPaths).join(", ") || "(none)"}`,
-				"",
-				"Network:",
-				`  Configured allowed domains: ${configuredDomainsLabel}`,
-				`  Effective allowed domains: ${effectiveDomainsLabel}`,
-				"  Unix sockets: unrestricted",
-				`  Denied domains: ${effectiveDeniedDomains().join(", ") || "(none)"}`,
-				`  Local binding: ${osSandboxConfig?.network?.allowLocalBinding ? "allowed" : "blocked"}`,
-			];
-			if (session.highRiskPrefixes.size) {
-				lines.push("", `Session high-risk prefixes (${session.highRiskPrefixes.size}):`);
-				for (const prefix of [...session.highRiskPrefixes].sort()) lines.push(`  ${prefix}`);
+
+			// Interactive management loop
+			let action: string | null = "show";
+			while (action) {
+				if (action === "show") {
+					action = await showSandboxManager(ctx);
+				} else if (action === "add") {
+					await sandboxAddFlow(ctx);
+					action = "show";
+				} else if (action === "clear") {
+					await sandboxClearFlow(ctx);
+					action = "show";
+				} else {
+					action = null;
+				}
 			}
-			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 }

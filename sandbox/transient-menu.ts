@@ -1,9 +1,10 @@
 /**
- * Transient menu — single-keypress overlay menus for sandbox prompts.
+ * Transient menu — single-keypress bottom panel for sandbox prompts.
  *
- * Inspired by magit/which-key. Renders a bordered overlay with keybinding
- * groups, responds to single keypresses, and includes a configurable grace
- * period to prevent accidental triggers from buffered input.
+ * Inspired by magit/which-key. Replaces the editor and footer with a clean
+ * panel at the bottom of the screen. Conversation stays fully visible above.
+ * Responds to single keypresses and includes a configurable grace period to
+ * prevent accidental triggers from buffered input.
  */
 
 import { matchesKey, Key, visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
@@ -55,7 +56,7 @@ function collectBindings<T>(options: TransientOptions<T>): Binding<T>[] {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
-const LPAD = 2;
+export const LPAD = 2;
 
 interface Styles {
 	border: (s: string) => string;
@@ -67,23 +68,20 @@ interface Styles {
 	escKey: (s: string) => string;
 }
 
-function borderLine(l: string, r: string, w: number, fn: Styles["border"], label?: { text: string; style: (s: string) => string }): string {
-	if (!label) return fn(l + "─".repeat(w - 2) + r);
-	const t = ` ${label.text} `;
-	const fill = Math.max(0, w - 3 - t.length);
-	return fn(l + "─") + label.style(t) + fn("─".repeat(fill) + r);
+export function titleRule(width: number, title: string, border: (s: string) => string, titleStyle: (s: string) => string): string {
+	const t = ` ${title} `;
+	const styled = titleStyle(t);
+	const pre = "───";
+	const rest = Math.max(0, width - 3 - visibleWidth(styled));
+	return border(pre) + styled + border("─".repeat(rest));
 }
 
-function contentLine(inner: string, w: number, border: Styles["border"]): string {
-	const maxW = w - 2 - LPAD;
-	const truncated = truncateToWidth(inner, maxW);
-	const vw = visibleWidth(truncated);
-	const pad = Math.max(0, maxW - vw);
-	return border("│") + " ".repeat(LPAD) + truncated + " ".repeat(pad) + border("│");
+export function bottomRule(width: number, border: (s: string) => string): string {
+	return border("─".repeat(width));
 }
 
-function blankLine(w: number, border: Styles["border"]): string {
-	return border("│") + " ".repeat(w - 2) + border("│");
+export function pad(content: string, width: number): string {
+	return truncateToWidth(" ".repeat(LPAD) + content, width);
 }
 
 function renderRow<T>(bindings: Binding<T>[], s: Styles): string {
@@ -117,121 +115,140 @@ function renderMatrix<T>(
 	return lines;
 }
 
+export function hintsLine(
+	leftHints: string,
+	rightHints: string,
+	width: number,
+): string {
+	const leftVW = visibleWidth(leftHints);
+	const rightVW = visibleWidth(rightHints);
+	const total = LPAD + leftVW + 3 + rightVW;
+	if (total <= width) {
+		const gap = width - LPAD - leftVW - rightVW;
+		return truncateToWidth(" ".repeat(LPAD) + leftHints + " ".repeat(gap) + rightHints, width);
+	}
+	// Fallback: just right-align the cancel
+	return truncateToWidth(" ".repeat(Math.max(0, width - rightVW)) + rightHints, width);
+}
+
+// ── Footer hiding ────────────────────────────────────────────────────────────
+
+const emptyFooterFactory = (_tui: any, _theme: any, _footerData: any) => ({
+	render: (_width: number): string[] => [],
+	invalidate: () => {},
+});
+
+/**
+ * Run a custom UI component as a bottom panel, hiding the footer while active.
+ */
+export async function withPanelUI<T>(
+	ctx: { ui: any; hasUI?: boolean },
+	factory: (tui: any, theme: any, kb: any, done: (v: T) => void) => any,
+): Promise<T> {
+	if (typeof ctx.ui.setFooter === "function") ctx.ui.setFooter(emptyFooterFactory);
+	try {
+		return await ctx.ui.custom<T>(factory);
+	} finally {
+		if (typeof ctx.ui.setFooter === "function") ctx.ui.setFooter(undefined);
+	}
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
-export function showTransient<T>(
+export async function showTransient<T>(
 	ctx: { ui: any; hasUI?: boolean },
 	options: TransientOptions<T>,
 ): Promise<T> {
-	if (!ctx.hasUI) return Promise.resolve(options.cancelValue);
+	if (!ctx.hasUI) return options.cancelValue;
 
-	return ctx.ui.custom<T>(
-		(tui: any, theme: any, _kb: any, done: (v: T) => void) => {
-			const graceDuration = options.grace ?? 500;
-			const graceUntil = Date.now() + graceDuration;
-			let graceActive = graceDuration > 0;
-			let cachedWidth: number | undefined;
-			let cachedLines: string[] | undefined;
+	return withPanelUI<T>(ctx, (tui: any, theme: any, _kb: any, done: (v: T) => void) => {
+		const graceDuration = options.grace ?? 500;
+		const graceUntil = Date.now() + graceDuration;
+		let graceActive = graceDuration > 0;
+		let cachedWidth: number | undefined;
+		let cachedLines: string[] | undefined;
 
-			const timer =
-				graceDuration > 0
-					? setTimeout(() => {
-							graceActive = false;
-							cachedWidth = undefined;
-							cachedLines = undefined;
-							tui.requestRender();
-						}, graceDuration)
-					: undefined;
+		const timer =
+			graceDuration > 0
+				? setTimeout(() => {
+						graceActive = false;
+						cachedWidth = undefined;
+						cachedLines = undefined;
+						tui.requestRender();
+					}, graceDuration)
+				: undefined;
 
-			const bindings = collectBindings(options);
+		const bindings = collectBindings(options);
 
-			return {
-				handleInput(data: string) {
-					// ESC always works, even during grace
-					if (matchesKey(data, Key.escape)) {
+		return {
+			handleInput(data: string) {
+				if (matchesKey(data, Key.escape)) {
+					if (timer) clearTimeout(timer);
+					done(options.cancelValue);
+					return;
+				}
+				if (Date.now() < graceUntil) return;
+				for (const b of bindings) {
+					if (matchBinding(data, b)) {
 						if (timer) clearTimeout(timer);
-						done(options.cancelValue);
+						done(b.value);
 						return;
 					}
-					if (Date.now() < graceUntil) return;
-					for (const b of bindings) {
-						if (matchBinding(data, b)) {
-							if (timer) clearTimeout(timer);
-							done(b.value);
-							return;
-						}
-					}
-				},
-
-				render(width: number): string[] {
-					if (cachedLines && cachedWidth === width) return cachedLines;
-
-					const s: Styles = {
-						border: (t) => theme.fg("border", t),
-						title: (t) => theme.fg("accent", theme.bold(t)),
-						key: (k) => (graceActive ? theme.fg("dim", k) : theme.fg("accent", k)),
-						text: (t) => theme.fg("text", t),
-						muted: (t) => theme.fg("muted", t),
-						dim: (t) => theme.fg("dim", t),
-						escKey: (t) => theme.fg("accent", t), // ESC always bright
-					};
-
-					const lines: string[] = [];
-					lines.push(borderLine("╭", "╮", width, s.border, { text: options.title, style: s.title }));
-					for (const c of options.context) lines.push(contentLine(s.muted(c), width, s.border));
-					lines.push(borderLine("├", "┤", width, s.border));
-
-					for (const section of options.sections) {
-						if (section.type === "spacer") {
-							lines.push(blankLine(width, s.border));
-						} else if (section.type === "row") {
-							lines.push(contentLine(renderRow(section.bindings, s), width, s.border));
-						} else if (section.type === "matrix") {
-							for (const ml of renderMatrix(section.columns, section.rows, s))
-								lines.push(contentLine(ml, width, s.border));
-						}
-					}
-
-					// Footer: optional left bindings + right-aligned cancel
-					lines.push(blankLine(width, s.border));
-					const maxW = width - 2 - LPAD;
-					const cancelStr = `${s.escKey("ESC")}  ${s.muted(options.cancelLabel ?? "deny")}`;
-					const cancelVW = visibleWidth(cancelStr);
-
-					if (options.footer?.length) {
-						const leftStr = renderRow(options.footer, s);
-						const leftVW = visibleWidth(leftStr);
-						if (leftVW + 3 + cancelVW <= maxW) {
-							const gap = maxW - leftVW - cancelVW;
-							lines.push(contentLine(leftStr + " ".repeat(gap) + cancelStr, width, s.border));
-						} else {
-							lines.push(contentLine(leftStr, width, s.border));
-							lines.push(contentLine(" ".repeat(Math.max(0, maxW - cancelVW)) + cancelStr, width, s.border));
-						}
-					} else {
-						lines.push(contentLine(" ".repeat(Math.max(0, maxW - cancelVW)) + cancelStr, width, s.border));
-					}
-
-					lines.push(borderLine("╰", "╯", width, s.border));
-
-					cachedWidth = width;
-					cachedLines = lines;
-					return lines;
-				},
-
-				invalidate() {
-					cachedWidth = undefined;
-					cachedLines = undefined;
-				},
-			};
-		},
-		{
-			overlay: true,
-			overlayOptions: {
-				anchor: "bottom-center" as any,
-				width: "60%",
-				minWidth: 50,
+				}
 			},
-		},
-	);
+
+			render(width: number): string[] {
+				if (cachedLines && cachedWidth === width) return cachedLines;
+
+				const s: Styles = {
+					border: (t) => theme.fg("border", t),
+					title: (t) => theme.fg("accent", theme.bold(t)),
+					key: (k) => (graceActive ? theme.fg("dim", k) : theme.fg("accent", k)),
+					text: (t) => theme.fg("text", t),
+					muted: (t) => theme.fg("muted", t),
+					dim: (t) => theme.fg("dim", t),
+					escKey: (t) => theme.fg("accent", t),
+				};
+
+				const lines: string[] = [];
+
+				// Title rule
+				lines.push(titleRule(width, options.title, s.border, s.title));
+
+				// Context
+				for (const c of options.context) lines.push(pad(s.muted(c), width));
+				lines.push("");
+
+				// Sections
+				for (const section of options.sections) {
+					if (section.type === "spacer") {
+						lines.push("");
+					} else if (section.type === "row") {
+						lines.push(pad(renderRow(section.bindings, s), width));
+					} else if (section.type === "matrix") {
+						for (const ml of renderMatrix(section.columns, section.rows, s))
+							lines.push(pad(ml, width));
+					}
+				}
+
+				// Hints
+				lines.push("");
+				const cancelStr = `${s.escKey("ESC")}  ${s.muted(options.cancelLabel ?? "deny")}`;
+				const leftStr = options.footer?.length ? renderRow(options.footer, s) : "";
+				lines.push(hintsLine(leftStr, cancelStr, width));
+
+				// Bottom rule
+				lines.push(bottomRule(width, s.border));
+
+				cachedWidth = width;
+				cachedLines = lines;
+				return lines;
+			},
+
+			invalidate() {
+				cachedWidth = undefined;
+				cachedLines = undefined;
+			},
+		};
+	});
 }
